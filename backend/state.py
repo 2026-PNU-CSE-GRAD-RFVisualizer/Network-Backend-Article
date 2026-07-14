@@ -1,0 +1,130 @@
+import time
+from collections import defaultdict, deque
+from typing import Any
+
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+class NodeRegistry:
+    def __init__(self, timeout_seconds: float) -> None:
+        self.timeout_ms = int(timeout_seconds * 1000)
+        self.nodes: dict[str, dict[str, Any]] = {}
+        self.last_seq: dict[str, int] = {}
+        self.receive_times: dict[str, deque[int]] = defaultdict(lambda: deque(maxlen=200))
+
+    def mark_online(self, node_id: str, online: bool) -> dict[str, Any]:
+        status = self._ensure(node_id)
+        status["online"] = online
+        if online:
+            status["last_seen"] = now_ms()
+        return status.copy()
+
+    def mark_seen(self, node_id: str, seq: int | None = None) -> tuple[dict[str, Any], bool]:
+        """측정값 수신 처리. (status_copy, became_online) 반환.
+
+        became_online: 직전 offline/미등록 -> online 으로 전환된 경우 True.
+        """
+        status = self._ensure(node_id)
+        was_online = status["online"]
+        current_ms = now_ms()
+        status["online"] = True
+        status["last_seen"] = current_ms
+        self.receive_times[node_id].append(current_ms)
+        status["msg_rate_hz"] = self._rate_hz(node_id, current_ms)
+
+        if seq is not None:
+            prev = self.last_seq.get(node_id)
+            if prev is not None and seq > prev + 1:
+                status["lost_packets"] += seq - prev - 1
+            if prev is None or seq > prev:
+                self.last_seq[node_id] = seq
+
+        return status.copy(), (not was_online)
+
+    def expire_offline(self) -> list[dict[str, Any]]:
+        current_ms = now_ms()
+        changed: list[dict[str, Any]] = []
+        for status in self.nodes.values():
+            last_seen = status.get("last_seen")
+            if last_seen is not None and current_ms - last_seen > self.timeout_ms:
+                if status["online"]:
+                    status["online"] = False
+                    changed.append(status.copy())
+        return changed
+
+    def snapshot(self) -> list[dict[str, Any]]:
+        current_ms = now_ms()
+        result = []
+        for node_id, status in self.nodes.items():
+            item = status.copy()
+            item["msg_rate_hz"] = self._rate_hz(node_id, current_ms)
+            result.append(item)
+        return sorted(result, key=lambda item: item["node_id"])
+
+    def known_nodes(self) -> set[str]:
+        return set(self.nodes)
+
+    def _ensure(self, node_id: str) -> dict[str, Any]:
+        if node_id not in self.nodes:
+            self.nodes[node_id] = {
+                "node_id": node_id,
+                "online": False,
+                "last_seen": None,
+                "msg_rate_hz": 0.0,
+                "lost_packets": 0,
+            }
+        return self.nodes[node_id]
+
+    def _rate_hz(self, node_id: str, current_ms: int) -> float:
+        samples = self.receive_times[node_id]
+        while samples and current_ms - samples[0] > 5000:
+            samples.popleft()
+        if len(samples) < 2:
+            return 0.0
+        elapsed_s = max((samples[-1] - samples[0]) / 1000, 0.001)
+        return round((len(samples) - 1) / elapsed_s, 3)
+
+class WindowBuffer:
+    def __init__(self, window_size_ms: int) -> None:
+        self.window_size_ms = window_size_ms
+        self.buckets: dict[int, dict[str, dict[str, Any]]] = defaultdict(dict)
+
+    def add(self, measurement: dict[str, Any], receive_ms: int) -> None:
+        bucket_ts = receive_ms - (receive_ms % self.window_size_ms)
+        node_id = measurement["node_id"]
+        current = self.buckets[bucket_ts].get(node_id)
+        if current is None or receive_ms >= current["_receive_ms"]:
+            item = dict(measurement)
+            item["_receive_ms"] = receive_ms
+            self.buckets[bucket_ts][node_id] = item
+
+    def pop_ready(self, current_ms: int, known_nodes: set[str]) -> list[dict[str, Any]]:
+        ready_before = current_ms - self.window_size_ms
+        frames: list[dict[str, Any]] = []
+        for bucket_ts in sorted(list(self.buckets)):
+            if bucket_ts > ready_before:
+                continue
+            bucket = self.buckets.pop(bucket_ts)
+            nodes = {
+                node_id: {
+                    "rssi": item["rssi"],
+                    "ap_bssid": item.get("ap_bssid"),
+                    "seq": item.get("seq"),
+                    "node_ts": item.get("timestamp"),
+                    "server_receive_ms": item["_receive_ms"],
+                    "pos": {"x": item.get("pos_x"), "y": item.get("pos_y"), "z": item.get("pos_z")},
+                    "rot": {"w": item.get("rot_w"), "x": item.get("rot_x"),
+                            "y": item.get("rot_y"), "z": item.get("rot_z")},
+                }
+                for node_id, item in sorted(bucket.items())
+            }
+            frames.append(
+                {
+                    "type": "rssi_frame",
+                    "window_ts": bucket_ts,
+                    "window_size_ms": self.window_size_ms,
+                    "nodes": nodes,
+                    "missing": sorted(known_nodes - set(nodes)),
+                }
+            )
+        return frames

@@ -1,0 +1,33 @@
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: jhkang-mosquitto
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquitto-data:/mosquitto/data
+      - mosquitto-log:/mosquitto/log
+
+  postgres:
+    image: postgres:17
+    container_name: jhkang-postgres
+    environment:
+      POSTGRES_USER: jhkang
+      POSTGRES_PASSWORD: jhkang
+      POSTGRES_DB: jhkang_network
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/001-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jhkang -d jhkang_network"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  mosquitto-data:
+  mosquitto-log:
+  postgres-data:
