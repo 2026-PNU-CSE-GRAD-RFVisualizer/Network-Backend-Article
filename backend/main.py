@@ -1,31 +1,86 @@
 import asyncio
 import logging
-import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 
 from .config import settings
 from .database import Database
+from .experiment import SessionManager, compute_device_offsets
+from .export import export_experiment, import_points_csv
 from .metrics import Metrics
 from .mqtt_bridge import MqttBridge
-from .state import NodeRegistry, WindowBuffer, now_ms
-from .ws import WebSocketHub
+from .pages import MEASURE_HTML
+from .realtime import WebSocketHub, WindowBuffer
+from .state import NodeRegistry, now_ms
+from .store import ExperimentStore
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
+logger = logging.getLogger(__name__)
 
 db = Database(settings.database_dsn)
 registry = NodeRegistry(settings.node_timeout_seconds)
-window_buffer = WindowBuffer(settings.window_size_ms)
+# 실시간 경로는 9월 졸업작품 범위. 논문 실험에서는 켜지 않는다.
+window_buffer = WindowBuffer(settings.window_size_ms) if settings.enable_realtime else None
+# hub 는 노드 online/offline 알림에도 쓰이므로 항상 만든다. 구독자가 없으면 비용이 없다.
 hub = WebSocketHub()
 metrics = Metrics()
+store = ExperimentStore(settings.experiment_data_dir)
+sessions = SessionManager(store)
 mqtt_bridge: MqttBridge | None = None
 tasks: list[asyncio.Task] = []
+
+
+def require_experiment() -> str:
+    if sessions.experiment_id is None:
+        raise HTTPException(status_code=400, detail="실험이 시작되지 않았습니다.")
+    return sessions.experiment_id
+
+
+class ExperimentStart(BaseModel):
+    experiment_id: str
+    ap_bssid: str | None = None
+    ap_channel: int | None = None
+    note: str | None = None
+
+
+class SessionStart(BaseModel):
+    point_id: str
+    point_role: str
+    seconds: int | None = None
+    note: str | None = None
+    # 이 위치로 옮겨 놓은 이동 센서. 지정하면 세션 시작과 동시에 재배치된다.
+    moving_node_id: str | None = None
+
+
+class Assignment(BaseModel):
+    node_id: str
+    point_id: str
+    point_role: str
+
+
+class SessionStop(BaseModel):
+    discard: bool = False
+
+
+class PointsCsv(BaseModel):
+    csv: str
+
+
+class TxInput(BaseModel):
+    tx_id: str = "tx-01"
+    pos_x: float | None = None
+    pos_y: float | None = None
+    pos_z: float | None = None
+    frequency_hz: int | None = 2_400_000_000
+    note: str | None = None
+
 
 class NodeMeta(BaseModel):
     node_id: str
@@ -38,23 +93,6 @@ class NodeMeta(BaseModel):
     rot_z: float | None = None
     description: str | None = None
 
-async def flush_windows() -> None:
-    while True:
-        start = time.perf_counter()
-        frames = window_buffer.pop_ready(now_ms(), registry.known_nodes())
-        if frames:
-            emit_ms = now_ms()
-            for frame in frames:
-                for node in frame["nodes"].values():
-                    srv = node.get("server_receive_ms")
-                    if srv is not None:
-                        metrics.observe_collect_latency(emit_ms - srv)
-                await db.insert_frame(frame)
-                await hub.broadcast(frame)
-            metrics.inc_frames(len(frames))
-            metrics.observe_flush_ms((time.perf_counter() - start) * 1000)
-        await asyncio.sleep(settings.window_flush_interval_ms / 1000)
-
 async def watch_heartbeats() -> None:
     while True:
         for status in registry.expire_offline():
@@ -62,20 +100,37 @@ async def watch_heartbeats() -> None:
             await hub.broadcast({"type": "node_status", "node": status})
         await asyncio.sleep(1)
 
+async def watch_session_deadline() -> None:
+    """30초가 지난 세션을 자동 종료한다. 현장에서 정지 버튼을 누를 필요가 없다."""
+    while True:
+        finished = sessions.auto_stop_if_expired()
+        if finished is not None:
+            await hub.broadcast({"type": "session_finished", "session": finished})
+        await asyncio.sleep(0.2)
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global mqtt_bridge
     await db.connect()
     loop = asyncio.get_running_loop()
-    mqtt_bridge = MqttBridge(settings, loop, db, registry, window_buffer, hub, metrics)
+    mqtt_bridge = MqttBridge(settings, loop, db, registry, window_buffer, hub, metrics,
+                             store=store, sessions=sessions)
     mqtt_bridge.start()
     tasks.extend(
         [
-            asyncio.create_task(flush_windows()),
             asyncio.create_task(watch_heartbeats()),
+            asyncio.create_task(watch_session_deadline()),
             asyncio.create_task(db.flush_raw_loop(metrics)),
         ]
     )
+    if settings.enable_realtime and window_buffer is not None:
+        from .realtime.routes import flush_windows
+        tasks.append(asyncio.create_task(flush_windows(
+            window_buffer, registry, hub, metrics,
+            db.insert_frame, settings.window_flush_interval_ms)))
+        logger.info("realtime pipeline enabled (9월 졸업작품 범위)")
+    else:
+        logger.info("realtime pipeline disabled — 논문 실험 모드")
     try:
         yield
     finally:
@@ -85,8 +140,9 @@ async def lifespan(app: FastAPI):
         if mqtt_bridge is not None:
             mqtt_bridge.stop()
         await db.close()
+        store.close()
 
-app = FastAPI(title="3DGS RSSI Backend", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="3DGS RSSI Backend", version="0.4.0-paper", lifespan=lifespan)
 
 @app.get("/health")
 async def health() -> dict[str, object]:
@@ -95,7 +151,13 @@ async def health() -> dict[str, object]:
         "postgres_connected": db.connected,
         "mqtt_host": settings.mqtt_host,
         "mqtt_port": settings.mqtt_port,
+        "mqtt": mqtt_bridge.status() if mqtt_bridge else {"connected": False},
+        "enable_realtime": settings.enable_realtime,
         "window_size_ms": settings.window_size_ms,
+        "experiment_id": sessions.experiment_id,
+        "experiment_db": str(store.db_path),
+        "jsonl_backup": str(store.jsonl_path),
+        "rssi_filtered_scale": settings.rssi_filtered_scale,
     }
 
 @app.get("/nodes/status")
@@ -115,29 +177,139 @@ async def set_node_meta(meta: NodeMeta) -> dict[str, object]:
     await db.upsert_node_meta(meta.model_dump())
     return {"ok": True, "node_id": meta.node_id}
 
-@app.get("/position/latest")
-async def latest_position() -> dict[str, object]:
+# ----------------------------------------------------------------------
+# 논문 실험 API (7/23 강의실 측정)
+# ----------------------------------------------------------------------
+
+@app.post("/experiment/start")
+async def experiment_start(body: ExperimentStart) -> dict[str, object]:
+    return sessions.start_experiment(body.experiment_id, body.ap_bssid,
+                                     body.ap_channel, body.note)
+
+@app.post("/experiment/end")
+async def experiment_end() -> dict[str, object]:
+    return sessions.end_experiment()
+
+@app.get("/experiment/list")
+async def experiment_list() -> dict[str, object]:
+    return {"experiments": store.list_experiments()}
+
+@app.post("/experiment/assign")
+async def experiment_assign(body: Assignment) -> dict[str, object]:
+    try:
+        return sessions.assign(body.node_id, body.point_id, body.point_role)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+@app.get("/experiment/assignments")
+async def experiment_assignments() -> dict[str, object]:
+    return {"assignments": store.list_assignments(require_experiment())}
+
+@app.post("/session/start")
+async def session_start(body: SessionStart) -> dict[str, object]:
+    try:
+        session = sessions.start_session(
+            body.point_id, body.point_role,
+            body.seconds or settings.default_session_seconds, body.note,
+            moving_node_id=body.moving_node_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return session.to_dict()
+
+@app.post("/session/stop")
+async def session_stop(body: SessionStop) -> dict[str, object]:
+    return sessions.stop_session(discard=body.discard)
+
+@app.get("/session/current")
+async def session_current() -> dict[str, object]:
+    """측정 페이지가 0.5초마다 호출하는 상태 엔드포인트."""
+    active = sessions.active()
+    experiment_id = sessions.experiment_id
+    done: list[dict[str, object]] = []
+    if experiment_id:
+        done = [
+            {"point_id": s["point_id"], "point_role": s["point_role"],
+             "valid_samples": s["valid_samples"]}
+            for s in store.list_sessions(experiment_id)
+            if not s["superseded"]
+        ]
     return {
-        "timestamp": now_ms(),
-        "position_x": None,
-        "position_y": None,
-        "position_z": None,
-        "confidence": 0.0,
-        "status": "interface_ready_algorithm_pending",
+        "experiment_id": experiment_id,
+        "ap_bssid": sessions.ap_bssid,
+        "ap_channel": sessions.ap_channel,
+        "session": active.to_dict() if active else None,
+        "progress": store.session_progress(active.session_id) if active else [],
+        "done_points": done,
+        "assignments": [
+            {"node_id": n, "point_id": p, "point_role": r}
+            for n, (p, r) in sorted(sessions.assignments().items())
+        ],
+        "tx": store.list_tx(experiment_id) if experiment_id else [],
+        "mqtt": mqtt_bridge.status() if mqtt_bridge else {"connected": False},
     }
 
-@app.websocket("/frames")
-async def frames(websocket: WebSocket) -> None:
-    await hub.connect(websocket)
-    await hub.send(websocket, {"type": "node_status_snapshot", "nodes": registry.snapshot()})
-    try:
-        while True:
-            await websocket.receive_text()
-    except WebSocketDisconnect:
-        hub.disconnect(websocket)
+@app.get("/experiment/sessions")
+async def experiment_sessions() -> dict[str, object]:
+    return {"sessions": store.list_sessions(require_experiment())}
+
+@app.get("/experiment/points")
+async def experiment_points() -> dict[str, object]:
+    return {"points": store.list_points(require_experiment())}
+
+@app.post("/experiment/points/import")
+async def experiment_points_import(body: PointsCsv) -> dict[str, object]:
+    return import_points_csv(store, require_experiment(), body.csv, now_ms())
+
+@app.post("/experiment/tx")
+async def experiment_tx(body: TxInput) -> dict[str, object]:
+    experiment_id = require_experiment()
+    store.upsert_tx(experiment_id, body.tx_id, body.pos_x, body.pos_y, body.pos_z,
+                    body.frequency_hz, sessions.ap_bssid, sessions.ap_channel, body.note)
+    return {"ok": True, "tx": store.list_tx(experiment_id)}
+
+@app.post("/experiment/offsets/compute")
+async def experiment_offsets() -> dict[str, object]:
+    return compute_device_offsets(store, require_experiment())
+
+@app.post("/experiment/export")
+async def experiment_export() -> dict[str, object]:
+    experiment_id = require_experiment()
+    # 내보내기 직전에 offset 을 다시 계산해 summary 의 corrected_rssi 를 최신 상태로 만든다.
+    compute_device_offsets(store, experiment_id)
+    return export_experiment(store, experiment_id, settings.export_root,
+                             settings.expected_samples_per_point)
+
+@app.get("/experiment/download/{which}")
+async def experiment_download(which: str) -> FileResponse:
+    experiment_id = require_experiment()
+    paths = {
+        "raw": Path(settings.export_root) / experiment_id / "raw" / "measurements_raw.csv",
+        "summary": Path(settings.export_root) / experiment_id / "processed" / "measurements_summary.csv",
+        "calibration": Path(settings.export_root) / experiment_id / "processed" / "calibration_points.csv",
+        "test": Path(settings.export_root) / experiment_id / "processed" / "test_points.csv",
+    }
+    path = paths.get(which)
+    if path is None:
+        raise HTTPException(status_code=404, detail=f"알 수 없는 파일: {which}")
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="먼저 CSV 내보내기를 실행하세요.")
+    return FileResponse(path, filename=path.name, media_type="text/csv")
 
 @app.get("/", response_class=HTMLResponse)
+@app.get("/measure", response_class=HTMLResponse)
+async def measure_page() -> str:
+    """현장 측정 페이지. 논문 실험의 기본 화면이므로 루트에 둔다."""
+    return MEASURE_HTML
+
+
+# 실시간 라우트(WS /frames, /position/latest)는 ENABLE_REALTIME=true 일 때만 붙는다.
+if settings.enable_realtime:
+    from .realtime.routes import build_router
+    app.include_router(build_router(hub, registry))
+
+@app.get("/monitor", response_class=HTMLResponse)
 async def dashboard() -> str:
+    """노드 상태·성능 모니터. 측정 중 5개 노드가 살아 있는지 확인하는 용도."""
     return DASHBOARD_HTML
 
 DASHBOARD_HTML = """<!doctype html>
@@ -153,7 +325,8 @@ DASHBOARD_HTML = """<!doctype html>
  .card{background:#1a1e27;border:1px solid #2a2f3a;border-radius:8px;padding:12px 16px;min-width:140px}
  .card .v{font-size:20px;font-weight:600} .card .l{font-size:12px;color:#9aa0a6}
 </style></head><body>
-<h1>3DGS RSSI Network Monitor</h1>
+<h1>3DGS RSSI Network Monitor
+ &nbsp;<a href="/" style="font-size:13px;color:#6ea8fe">→ 강의실 측정 페이지</a></h1>
 <div id="conn"></div>
 <h2>성능 지표 (metrics)</h2>
 <div class="cards" id="cards"></div>

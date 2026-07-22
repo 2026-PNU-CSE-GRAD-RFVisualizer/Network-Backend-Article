@@ -1,6 +1,9 @@
+"""NodeRegistry(논문 실험에서도 사용) + WindowBuffer(9월 졸업작품 범위) 단위 테스트."""
+
 import time
 
-from backend.state import NodeRegistry, WindowBuffer, now_ms
+from backend.realtime import WindowBuffer
+from backend.state import NodeRegistry, now_ms
 
 
 def test_window_not_ready_immediately():

@@ -1,29 +1,9 @@
-import json
-from typing import Any
+"""이 모듈은 backend/realtime/ws.py 로 이동했다.
 
-from fastapi import WebSocket
+기존 import 를 깨뜨리지 않기 위한 재수출 shim.
+새 코드는 `from .realtime import WebSocketHub` 를 사용한다.
+"""
 
-class WebSocketHub:
-    def __init__(self) -> None:
-        self._clients: set[WebSocket] = set()
+from .realtime.ws import WebSocketHub
 
-    async def connect(self, websocket: WebSocket) -> None:
-        await websocket.accept()
-        self._clients.add(websocket)
-
-    def disconnect(self, websocket: WebSocket) -> None:
-        self._clients.discard(websocket)
-
-    async def send(self, websocket: WebSocket, payload: dict[str, Any]) -> None:
-        await websocket.send_text(json.dumps(payload))
-
-    async def broadcast(self, payload: dict[str, Any]) -> None:
-        data = json.dumps(payload)
-        disconnected: list[WebSocket] = []
-        for client in list(self._clients):
-            try:
-                await client.send_text(data)
-            except Exception:
-                disconnected.append(client)
-        for client in disconnected:
-            self.disconnect(client)
+__all__ = ["WebSocketHub"]

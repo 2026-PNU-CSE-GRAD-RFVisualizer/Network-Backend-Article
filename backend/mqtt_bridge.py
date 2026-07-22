@@ -8,9 +8,12 @@ import paho.mqtt.client as mqtt
 
 from .config import Settings
 from .database import Database
+from .experiment import SessionManager
 from .metrics import Metrics
-from .state import NodeRegistry, WindowBuffer, now_ms
-from .ws import WebSocketHub
+from .parsing import ParseConfig, parse_measurement
+from .realtime import WebSocketHub, WindowBuffer
+from .state import NodeRegistry, now_ms
+from .store import ExperimentStore
 
 logger = logging.getLogger(__name__)
 
@@ -21,9 +24,11 @@ class MqttBridge:
         loop: asyncio.AbstractEventLoop,
         db: Database,
         registry: NodeRegistry,
-        window_buffer: WindowBuffer,
+        window_buffer: WindowBuffer | None,
         hub: WebSocketHub,
         metrics: Metrics,
+        store: ExperimentStore | None = None,
+        sessions: SessionManager | None = None,
     ) -> None:
         self.settings = settings
         self.loop = loop
@@ -32,6 +37,15 @@ class MqttBridge:
         self.window_buffer = window_buffer
         self.hub = hub
         self.metrics = metrics
+        self.store = store
+        self.sessions = sessions
+        # 브로커 연결 상태. 현장에서 "샘플이 안 들어오는 이유"를 구분하려면 필요하다.
+        # (브로커가 죽은 것인지, ESP32 가 죽은 것인지)
+        self.connected = False
+        self.connect_count = 0
+        self.disconnect_count = 0
+        self.last_connected_ms: int | None = None
+        self.last_disconnected_ms: int | None = None
         self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="jhkang-backend")
         if settings.mqtt_username:
             self.client.username_pw_set(settings.mqtt_username, settings.mqtt_password)
@@ -49,19 +63,58 @@ class MqttBridge:
         self.client.disconnect()
 
     def _on_connect(self, client: mqtt.Client, userdata: Any, flags: Any, reason_code: Any, properties: Any) -> None:
-        logger.info("mqtt connected: %s", reason_code)
+        self.connected = True
+        self.connect_count += 1
+        self.last_connected_ms = now_ms()
+        # 재연결 시에도 구독을 다시 걸어야 한다. 브로커가 재시작되면 세션이 사라지므로
+        # 여기서 다시 subscribe 하지 않으면 연결은 살아 있는데 메시지가 오지 않는다.
         client.subscribe("rssi/#")
         client.subscribe("gateway/#")
         client.subscribe("status/+/lwt")
+        if self.connect_count > 1:
+            logger.warning("mqtt RECONNECTED (%d번째): %s — 구독 재설정 완료",
+                           self.connect_count, reason_code)
+        else:
+            logger.info("mqtt connected: %s", reason_code)
 
     def _on_disconnect(self, client: mqtt.Client, userdata: Any, flags: Any, reason_code: Any, properties: Any) -> None:
-        logger.warning("mqtt disconnected: %s", reason_code)
+        self.connected = False
+        self.disconnect_count += 1
+        self.last_disconnected_ms = now_ms()
+        active = self.sessions.active() if self.sessions else None
+        if active is not None:
+            logger.error("mqtt DISCONNECTED 측정 중! point=%s — 이 위치는 재측정이 필요할 수 있다: %s",
+                         active.point_id, reason_code)
+        else:
+            logger.warning("mqtt disconnected: %s", reason_code)
+
+    def status(self) -> dict[str, Any]:
+        return {
+            "connected": self.connected,
+            "connect_count": self.connect_count,
+            "disconnect_count": self.disconnect_count,
+            "last_connected_ms": self.last_connected_ms,
+            "last_disconnected_ms": self.last_disconnected_ms,
+        }
 
     def _on_message(self, client: mqtt.Client, userdata: Any, msg: mqtt.MQTTMessage) -> None:
         asyncio.run_coroutine_threadsafe(self.handle_message(msg.topic, msg.payload), self.loop)
 
     async def handle_message(self, topic: str, payload: bytes) -> None:
         receive_ms = now_ms()
+
+        # 비상 경로 (계획서 §12): 파싱 성공 여부와 무관하게 원본을 먼저 남긴다.
+        # MQTT 이후 어느 단계가 실패해도 이 파일만 있으면 데이터를 복구할 수 있다.
+        if self.store is not None and not topic.endswith("/lwt"):
+            active = self.sessions.active() if self.sessions else None
+            self.store.append_jsonl(
+                topic,
+                payload.decode("utf-8", errors="replace"),
+                receive_ms,
+                active.session_id if active else None,
+                active.point_id if active else None,
+            )
+
         try:
             data = json.loads(payload.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
@@ -110,53 +163,63 @@ class MqttBridge:
             await self._ingest(measurement, receive_ms, server_dt)
 
     async def _ingest(self, measurement: dict[str, Any], receive_ms: int, server_dt: datetime) -> None:
-        """검증된 측정값 1건을 상태갱신 + 동기화버퍼 + 저장 파이프라인에 투입."""
+        """측정값 1건을 실험 저장소 + 실시간 파이프라인에 투입.
+
+        범위를 벗어난 값도 실험 저장소에는 valid=0 으로 기록한다.
+        계획서 §7.2 는 "Raw 데이터 보존"과 "비정상 RSSI 범위 제외"를 함께 요구하므로,
+        저장 단계에서 버리지 않고 분석 단계에서 제외하는 방식을 쓴다.
+        """
+        self._record_experiment(measurement, receive_ms)
+
+        if not measurement["valid"]:
+            self.metrics.inc_dropped()
+            return
+
         status, became_online = self.registry.mark_seen(measurement["node_id"], measurement.get("seq"))
-        self.window_buffer.add(measurement, receive_ms)
+        if self.window_buffer is not None:   # 실시간 경로가 켜져 있을 때만
+            self.window_buffer.add(measurement, receive_ms)
         self.db.enqueue_raw(measurement, server_dt)
         await self.db.upsert_node_status(status)
         if became_online:
             await self.hub.broadcast({"type": "node_status", "node": status})
 
+    def _record_experiment(self, measurement: dict[str, Any], receive_ms: int) -> None:
+        """세션이 활성일 때만 실험 테이블에 기록한다."""
+        if self.store is None or self.sessions is None:
+            return
+        active = self.sessions.active()
+        if active is None:
+            return
+        # 세션 마감 시각을 넘겨 도착한 샘플은 그 위치의 30초 창에 속하지 않는다.
+        if receive_ms > active.deadline_ms:
+            return
+        # 위치는 세션 라벨이 아니라 '이 노드가 지금 어디에 놓여 있는지'로 정한다.
+        # 고정 보정 센서 4대는 모든 세션 동안 각자의 보정 위치 데이터를 계속 쌓는다.
+        point_id, point_role = self.sessions.resolve(measurement["node_id"], active)
+        self.store.insert_measurements([{
+            "experiment_id": active.experiment_id,
+            "session_id": active.session_id,
+            "point_id": point_id,
+            "point_role": point_role,
+            "node_id": measurement["node_id"],
+            "node_ts_ms": measurement.get("timestamp"),
+            "server_ts_ms": receive_ms,
+            "seq": measurement.get("seq"),
+            "rssi_raw_dbm": measurement.get("rssi_raw"),
+            "rssi_filtered_dbm": measurement.get("rssi_filtered"),
+            "sample_count": measurement.get("sample_count"),
+            "error_flags": measurement.get("status", 0),
+            "ap_bssid": measurement.get("ap_bssid"),
+            "ap_channel": measurement.get("ap_channel"),
+            "valid": measurement["valid"],
+            "invalid_reason": measurement.get("invalid_reason"),
+        }])
+
     def _validate_measurement(self, data: dict[str, Any], receive_ms: int) -> dict[str, Any] | None:
-        required = {"node_id", "timestamp", "rssi"}
-        if not required <= data.keys():
-            logger.warning("drop missing fields: %s", sorted(required - set(data.keys())))
-            return None
-
-        try:
-            node_id = str(data["node_id"])
-            timestamp = int(data["timestamp"])
-            rssi = int(data["rssi"])
-            seq = int(data["seq"]) if data.get("seq") is not None else None
-            status_code = int(data.get("status", 0))
-        except (TypeError, ValueError):
-            logger.warning("drop invalid field types: %s", data)
-            return None
-
-        if not (self.settings.rssi_min <= rssi <= self.settings.rssi_max):
-            logger.warning("drop out-of-range rssi node=%s rssi=%s", node_id, rssi)
-            return None
-
-        if abs(receive_ms - timestamp) > self.settings.timestamp_max_skew_ms:
-            logger.warning("replace skewed node timestamp node=%s timestamp=%s", node_id, timestamp)
-            timestamp = receive_ms
-
-        def _f(key: str) -> float | None:
-            v = data.get(key)
-            try:
-                return float(v) if v is not None else None
-            except (TypeError, ValueError):
-                return None
-
-        return {
-            "node_id": node_id,
-            "timestamp": timestamp,
-            "ap_bssid": data.get("ap_bssid"),
-            "rssi": rssi,
-            "rssi_raw": data.get("rssi_raw"),
-            "seq": seq,
-            "status": status_code,
-            "pos_x": _f("pos_x"), "pos_y": _f("pos_y"), "pos_z": _f("pos_z"),
-            "rot_w": _f("rot_w"), "rot_x": _f("rot_x"), "rot_y": _f("rot_y"), "rot_z": _f("rot_z"),
-        }
+        """파싱은 backend/parsing.py 의 순수 함수에 위임한다 (브로커 없이 테스트 가능)."""
+        return parse_measurement(data, receive_ms, ParseConfig(
+            rssi_min=self.settings.rssi_min,
+            rssi_max=self.settings.rssi_max,
+            timestamp_max_skew_ms=self.settings.timestamp_max_skew_ms,
+            rssi_filtered_scale=self.settings.rssi_filtered_scale,
+        ))

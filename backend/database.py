@@ -142,6 +142,7 @@ class Database:
                 logger.exception("batch insert failed (%d rows)", len(records))
 
     async def insert_frame(self, frame: dict[str, Any]) -> None:
+        """실시간 경로 전용 (9월 졸업작품). 논문 실험에서는 호출되지 않는다."""
         if self._pool is None:
             return
         window_dt = datetime.fromtimestamp(frame["window_ts"] / 1000, tz=timezone.utc)
