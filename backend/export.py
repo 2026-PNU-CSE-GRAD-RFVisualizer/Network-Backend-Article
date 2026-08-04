@@ -209,13 +209,36 @@ def export_experiment(store: ExperimentStore, experiment_id: str,
         writer.writeheader()
         writer.writerows(summary)
 
-    # 그래픽스 파트가 IDW 입력으로 바로 쓰는 두 파일 (보정점 / 평가점 분리)
-    for role, name in (("calibration", "calibration_points.csv"), ("test", "test_points.csv")):
+    # 역할별로 대표값(summary)을 분리해 저장한다.
+    # offset / calibration / test 세 역할을 각각 별도 파일로 만들어
+    # 그래픽스 파트가 필요한 역할만 골라 쓸 수 있게 한다.
+    #   calibration_points.csv, test_points.csv 는 기존 이름을 유지(하위 호환).
+    role_files = {
+        "offset": "offset_points.csv",
+        "calibration": "calibration_points.csv",
+        "test": "test_points.csv",
+    }
+    for role, name in role_files.items():
         path = root / "processed" / name
         with path.open("w", newline="", encoding="utf-8-sig") as fp:
             writer = csv.DictWriter(fp, fieldnames=SUMMARY_COLUMNS, extrasaction="ignore")
             writer.writeheader()
             writer.writerows([s for s in summary if s["point_role"] == role])
+
+    # 원본 시계열도 역할별로 분리해 by_role/ 폴더에 저장한다.
+    by_role_dir = root / "raw" / "by_role"
+    by_role_dir.mkdir(parents=True, exist_ok=True)
+    for role in role_files:
+        path = by_role_dir / f"measurements_raw_{role}.csv"
+        with path.open("w", newline="", encoding="utf-8-sig") as fp:
+            writer = csv.DictWriter(fp, fieldnames=RAW_COLUMNS, extrasaction="ignore")
+            writer.writeheader()
+            for r in rows:
+                if r["point_role"] != role:
+                    continue
+                item = dict(r)
+                item["timestamp"] = r.get("node_ts_ms")
+                writer.writerow(item)
 
     points_path = root / "config" / "points.csv"
     with points_path.open("w", newline="", encoding="utf-8-sig") as fp:
@@ -268,6 +291,7 @@ def export_experiment(store: ExperimentStore, experiment_id: str,
         "files": {
             "raw": str(raw_path),
             "summary": str(summary_path),
+            "offset": str(root / "processed" / "offset_points.csv"),
             "calibration": str(root / "processed" / "calibration_points.csv"),
             "test": str(root / "processed" / "test_points.csv"),
             "tx_rx": str(root / "config" / "tx_rx.json"),

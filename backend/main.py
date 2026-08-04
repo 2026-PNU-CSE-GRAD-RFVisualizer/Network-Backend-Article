@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -7,7 +8,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 
-from .config import settings
+from .config import PROJECT_ROOT, settings
 from .database import Database
 from .experiment import SessionManager, compute_device_offsets
 from .export import export_experiment, import_points_csv
@@ -31,7 +32,7 @@ window_buffer = WindowBuffer(settings.window_size_ms) if settings.enable_realtim
 # hub 는 노드 online/offline 알림에도 쓰이므로 항상 만든다. 구독자가 없으면 비용이 없다.
 hub = WebSocketHub()
 metrics = Metrics()
-store = ExperimentStore(settings.experiment_data_dir)
+store = ExperimentStore(settings.experiment_data_path)
 sessions = SessionManager(store)
 mqtt_bridge: MqttBridge | None = None
 tasks: list[asyncio.Task] = []
@@ -71,6 +72,12 @@ class SessionStop(BaseModel):
 
 class PointsCsv(BaseModel):
     csv: str
+
+
+class ExportRequest(BaseModel):
+    # 압축 리허설처럼 측정 시간이 짧을 때 기대 샘플 수를 낮춰 잡기 위한 값.
+    # 지정하지 않으면 설정값(위치당 30개)을 쓴다.
+    expected_samples: int | None = None
 
 
 class TxInput(BaseModel):
@@ -155,8 +162,10 @@ async def health() -> dict[str, object]:
         "enable_realtime": settings.enable_realtime,
         "window_size_ms": settings.window_size_ms,
         "experiment_id": sessions.experiment_id,
+        "project_root": str(PROJECT_ROOT),
         "experiment_db": str(store.db_path),
         "jsonl_backup": str(store.jsonl_path),
+        "export_root": str(settings.export_root_path),
         "rssi_filtered_scale": settings.rssi_filtered_scale,
     }
 
@@ -183,7 +192,14 @@ async def set_node_meta(meta: NodeMeta) -> dict[str, object]:
 
 @app.post("/experiment/start")
 async def experiment_start(body: ExperimentStart) -> dict[str, object]:
-    return sessions.start_experiment(body.experiment_id, body.ap_bssid,
+    # 실험 시작 버튼을 누를 때마다 입력한 이름 뒤에 실행 시각을 붙여
+    # 매번 새로운 experiment_id 를 만든다. 그러면:
+    #   - 이전 실험 폴더는 그대로 남고 (experiments/<이전id>/)
+    #   - 이번 실험은 새 폴더(experiments/<새id>/)에 저장된다.
+    # 예: classroom_20260723  ->  classroom_20260723_213045
+    base = body.experiment_id.strip() or "experiment"
+    run_id = f"{base}_{time.strftime('%H%M%S')}"
+    return sessions.start_experiment(run_id, body.ap_bssid,
                                      body.ap_channel, body.note)
 
 @app.post("/experiment/end")
@@ -272,21 +288,22 @@ async def experiment_offsets() -> dict[str, object]:
     return compute_device_offsets(store, require_experiment())
 
 @app.post("/experiment/export")
-async def experiment_export() -> dict[str, object]:
+async def experiment_export(body: ExportRequest | None = None) -> dict[str, object]:
     experiment_id = require_experiment()
     # 내보내기 직전에 offset 을 다시 계산해 summary 의 corrected_rssi 를 최신 상태로 만든다.
     compute_device_offsets(store, experiment_id)
-    return export_experiment(store, experiment_id, settings.export_root,
-                             settings.expected_samples_per_point)
+    expected = (body.expected_samples if body and body.expected_samples
+                else settings.expected_samples_per_point)
+    return export_experiment(store, experiment_id, settings.export_root_path, expected)
 
 @app.get("/experiment/download/{which}")
 async def experiment_download(which: str) -> FileResponse:
     experiment_id = require_experiment()
     paths = {
-        "raw": Path(settings.export_root) / experiment_id / "raw" / "measurements_raw.csv",
-        "summary": Path(settings.export_root) / experiment_id / "processed" / "measurements_summary.csv",
-        "calibration": Path(settings.export_root) / experiment_id / "processed" / "calibration_points.csv",
-        "test": Path(settings.export_root) / experiment_id / "processed" / "test_points.csv",
+        "raw": settings.export_root_path / experiment_id / "raw" / "measurements_raw.csv",
+        "summary": settings.export_root_path / experiment_id / "processed" / "measurements_summary.csv",
+        "calibration": settings.export_root_path / experiment_id / "processed" / "calibration_points.csv",
+        "test": settings.export_root_path / experiment_id / "processed" / "test_points.csv",
     }
     path = paths.get(which)
     if path is None:
