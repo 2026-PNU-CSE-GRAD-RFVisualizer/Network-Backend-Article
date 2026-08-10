@@ -22,3 +22,5 @@ logs/
 
 data/
 experiments/
+frames_out/
+__pycache__/
