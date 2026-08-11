@@ -1,7 +1,6 @@
 """실시간 경로의 라우트와 백그라운드 루프 — 9월 졸업작품 범위.
 
-main.py 는 ENABLE_REALTIME=true 일 때만 이 모듈을 불러 앱에 붙인다.
-논문 실험 경로는 이 파일에 전혀 의존하지 않는다.
+ENABLE_REALTIME=true 일 때만 main.py 가 붙인다. 논문 실험 경로는 이 파일에 의존하지 않는다.
 """
 
 from __future__ import annotations
@@ -47,7 +46,7 @@ def build_router(hub: WebSocketHub, registry: NodeRegistry) -> APIRouter:
 async def flush_windows(window_buffer: WindowBuffer, registry: NodeRegistry,
                         hub: WebSocketHub, metrics: Any,
                         insert_frame: Callable, flush_interval_ms: int) -> None:
-    """200ms 버킷이 마감되면 프레임을 만들어 저장·전송한다."""
+    """마감된 버킷을 프레임으로 만들어 저장·전송한다."""
     while True:
         start = time.perf_counter()
         frames = window_buffer.pop_ready(now_ms(), registry.known_nodes())

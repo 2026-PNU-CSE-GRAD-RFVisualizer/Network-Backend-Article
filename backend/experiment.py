@@ -1,7 +1,4 @@
-"""실험 세션 제어와 장치 offset 계산.
-
-계획서 §3.3 (위치당 30초), §4 (장치별 RSSI 편차 보정) 을 구현한다.
-"""
+"""실험 세션 제어와 장치 offset 계산 (계획서 §3.3 위치당 30초, §4 장치 편차 보정)."""
 
 from __future__ import annotations
 
@@ -47,7 +44,7 @@ class ActiveSession:
 
 
 class SessionManager:
-    """현재 어떤 위치를 측정 중인지를 들고 있는 단일 상태 객체.
+    """현재 측정 중인 위치를 들고 있는 단일 상태 객체.
 
     MQTT 수신 스레드와 HTTP 핸들러가 동시에 읽으므로 락으로 보호한다.
     """
@@ -59,10 +56,9 @@ class SessionManager:
         self._experiment_id: str | None = None
         self._ap_bssid: str | None = None
         self._ap_channel: int | None = None
-        # node_id -> (point_id, point_role). 각 노드가 지금 어느 위치에 놓여 있는지.
+        # node_id -> (point_id, point_role): 각 노드가 지금 놓인 위치
         self._assignments: dict[str, tuple[str, str]] = {}
 
-    # ------------------------------------------------------------------
     @property
     def experiment_id(self) -> str | None:
         return self._experiment_id
@@ -79,15 +75,9 @@ class SessionManager:
         with self._lock:
             return self._active
 
-    # ------------------------------------------------------------------
-    # 노드 배치
-    # ------------------------------------------------------------------
+    # -- 노드 배치 ------------------------------------------------------
     def assign(self, node_id: str, point_id: str, point_role: str) -> dict[str, Any]:
-        """노드를 특정 위치에 배치한다.
-
-        고정 보정 센서 4대는 실험 시작 시 한 번만 배치하면 되고,
-        이동 센서는 Test 위치를 옮길 때마다 재배치된다.
-        """
+        """노드를 위치에 배치. 고정 센서는 1회, 이동 센서는 Test 위치마다 재배치."""
         if self._experiment_id is None:
             raise ValueError("실험이 시작되지 않았습니다.")
         if point_role not in VALID_ROLES:
@@ -107,20 +97,15 @@ class SessionManager:
             return dict(self._assignments)
 
     def resolve(self, node_id: str, session: ActiveSession) -> tuple[str, str]:
-        """이 노드의 샘플이 어느 위치에 속하는지 결정한다.
-
-        배치가 없는 노드는 세션 라벨로 기록한다. 데이터를 잃는 것보다
-        나중에 CSV 에서 걸러내는 편이 안전하다.
-        """
+        """샘플이 속한 위치 결정. 배치 없는 노드는 세션 라벨로 두고 나중에 CSV에서 거른다."""
         with self._lock:
             found = self._assignments.get(node_id)
         return found if found is not None else (session.point_id, session.point_role)
 
-    # ------------------------------------------------------------------
     def start_experiment(self, experiment_id: str, ap_bssid: str | None,
                          ap_channel: int | None, note: str | None = None) -> dict[str, Any]:
         self.store.create_experiment(experiment_id, now_ms(), ap_bssid, ap_channel, note)
-        # 백엔드를 재시작해도 기존 배치를 그대로 이어받는다.
+        # 백엔드 재시작에도 기존 배치를 이어받는다.
         restored = {
             a["node_id"]: (a["point_id"], a["point_role"])
             for a in self.store.list_assignments(experiment_id)
@@ -144,7 +129,6 @@ class SessionManager:
             self.store.end_experiment(experiment_id, now_ms())
         return {"experiment_id": experiment_id, "ended": bool(experiment_id)}
 
-    # ------------------------------------------------------------------
     def start_session(self, point_id: str, point_role: str, planned_seconds: int,
                       note: str | None = None,
                       moving_node_id: str | None = None) -> ActiveSession:
@@ -156,7 +140,7 @@ class SessionManager:
         if not point_id:
             raise ValueError("point_id 가 비어 있습니다.")
 
-        # 이동 센서를 이번 위치로 재배치한다. 고정 센서 배치는 건드리지 않는다.
+        # 이동 센서만 이번 위치로 재배치. 고정 센서 배치는 유지.
         if moving_node_id:
             self.assign(moving_node_id, point_id, point_role)
 
@@ -184,7 +168,7 @@ class SessionManager:
         return {"stopped": True, "discarded": discard, "session": session.to_dict()}
 
     def auto_stop_if_expired(self) -> dict[str, Any] | None:
-        """백그라운드 루프가 호출. 30초가 지나면 세션을 자동 종료한다."""
+        """백그라운드 루프가 호출. 계획 시간이 지나면 세션 자동 종료."""
         with self._lock:
             session = self._active
             if session is None or session.remaining_ms() > 0:
@@ -195,15 +179,11 @@ class SessionManager:
         return session.to_dict()
 
 
-# ----------------------------------------------------------------------
-# 장치별 offset (계획서 §4.2)
-#   Δ_d = m_ref - m_d,  m_ref = median(모든 장치의 중앙값)
-#   RSSI_corrected = RSSI_measured + Δ_d
-# ----------------------------------------------------------------------
+# 장치별 offset (계획서 §4.2):
+#   Δ_d = m_ref - m_d,  m_ref = median(모든 장치의 중앙값),  RSSI_corrected = RSSI + Δ_d
 def compute_device_offsets(store: ExperimentStore, experiment_id: str) -> dict[str, Any]:
-    # offset 은 '5대를 한 자리에 모아 놓고 측정한 그 세션'의 데이터만 써야 한다.
-    # 이동 센서의 배치를 옮기기 전까지는 배치가 offset 으로 남아 있으므로,
-    # 세션 라벨과 위치가 일치하는 행만 채택해 그 사이 데이터가 섞이는 것을 막는다.
+    # offset 은 5대를 한 자리에 모아 측정한 세션 데이터만 사용한다. 세션 라벨과 위치가
+    # 일치하는 행만 채택해, 이동 센서 재배치 전후 데이터가 섞이는 것을 막는다.
     rows = [
         r for r in store.measurements_for_export(experiment_id)
         if r["point_role"] == "offset" and r["valid"] == 1

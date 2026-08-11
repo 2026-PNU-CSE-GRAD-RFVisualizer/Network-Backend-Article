@@ -1,8 +1,4 @@
-"""ESP32 페이로드 파싱 — 외부 의존성 없음.
-
-MQTT 클라이언트와 분리해 둔 이유는 이 로직이 실험 데이터의 정확성을 좌우하기 때문이다.
-브로커 없이 단위 테스트로 검증할 수 있어야 한다.
-"""
+"""ESP32 페이로드 파싱 — 외부 의존성 없음, 브로커 없이 단위 테스트 가능."""
 
 from __future__ import annotations
 
@@ -21,12 +17,10 @@ class ParseConfig(NamedTuple):
 
 def parse_measurement(data: dict[str, Any], receive_ms: int,
                       cfg: ParseConfig) -> dict[str, Any] | None:
-    """페이로드 1건을 파싱한다.
+    """페이로드 1건 파싱.
 
-    None 은 '구조 자체가 깨져 어느 노드/시각인지도 알 수 없음'을 의미하며 이때만 버린다.
-    값이 이상한 경우는 valid=False 로 표시해 통과시킨다. 계획서 §7.2 가
-    "Raw 데이터 보존"과 "비정상 RSSI 범위 제외"를 함께 요구하므로,
-    저장 단계에서 버리지 않고 분석 단계에서 제외한다.
+    None = 구조가 깨져 노드/시각도 알 수 없음(이때만 버림). 값이 이상한 경우는
+    valid=False 로 통과시켜 Raw 는 보존하고 분석 단계에서만 제외한다(계획서 §7.2).
     """
     if not {"node_id", "timestamp"} <= data.keys():
         logger.warning("drop missing fields: %s", sorted({"node_id", "timestamp"} - set(data)))
@@ -56,9 +50,7 @@ def parse_measurement(data: dict[str, Any], receive_ms: int,
         v = _f(*keys)
         return int(v) if v is not None else None
 
-    # 펌웨어 필드명 호환:
-    #   Filtered = rssi | rssi_filtered | rssi_filtered_dbm
-    #   Raw      = rssi_raw | rssi_raw_dbm
+    # 펌웨어 필드명 호환: Filtered=rssi|rssi_filtered|rssi_filtered_dbm, Raw=rssi_raw|rssi_raw_dbm
     filtered = _f("rssi_filtered_dbm", "rssi_filtered", "rssi")
     raw = _f("rssi_raw_dbm", "rssi_raw")
 
@@ -89,7 +81,7 @@ def parse_measurement(data: dict[str, Any], receive_ms: int,
         "timestamp": timestamp,
         "ap_bssid": data.get("ap_bssid"),
         "ap_channel": _i("ap_channel", "channel"),
-        # 실시간 파이프라인은 정수 rssi 를 기대하므로 대표값을 rssi 로도 유지한다.
+        # 실시간 파이프라인은 정수 rssi 를 기대하므로 대표값을 rssi 로도 유지
         "rssi": int(round(filtered)) if filtered is not None else None,
         "rssi_filtered": filtered,
         "rssi_raw": raw,

@@ -1,18 +1,9 @@
-"""실시간 시각화 경로 — 9월 졸업작품 범위.
+"""실시간 시각화 경로 — 9월 졸업작품 범위 (ENABLE_REALTIME=true 일 때만).
 
-논문 실험(7/23 강의실 30초 정지 측정)에는 사용하지 않는다.
-`ENABLE_REALTIME=true` 일 때만 활성화된다.
+포함: 200ms Window(WindowBuffer), WebSocket push(WS /frames), frame 저장,
+PositionEstimate(/position/latest). 논문 30초 정지 측정에는 사용하지 않는다.
 
-포함:
-  - 200ms Time Window 동기화 (WindowBuffer)
-  - WebSocket 프레임 push (WebSocketHub, WS /frames)
-  - frame 테이블 저장
-  - PositionEstimate 인터페이스 (/position/latest)
-
-논문 제출 후 이 패키지를 다시 켜고 그래픽스 파트의 실시간 뷰어와 연결한다.
-
-주의: WebSocketHub 는 fastapi 에 의존하므로 지연 로딩한다.
-WindowBuffer 는 순수 로직이라 fastapi 없이도 단위 테스트할 수 있어야 한다.
+WindowBuffer 는 순수 로직(fastapi 없이 테스트 가능), WebSocketHub 는 fastapi 의존이라 지연 로딩.
 """
 
 from typing import TYPE_CHECKING

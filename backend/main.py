@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 db = Database(settings.database_dsn)
 registry = NodeRegistry(settings.node_timeout_seconds)
 # 실시간 경로는 9월 졸업작품 범위. 논문 실험에서는 켜지 않는다.
-window_buffer = WindowBuffer(settings.window_size_ms) if settings.enable_realtime else None
+window_buffer = WindowBuffer(settings.window_size_ms, settings.window_grace_ms) if settings.enable_realtime else None
 # hub 는 노드 online/offline 알림에도 쓰이므로 항상 만든다. 구독자가 없으면 비용이 없다.
 hub = WebSocketHub()
 metrics = Metrics()
@@ -75,8 +75,7 @@ class PointsCsv(BaseModel):
 
 
 class ExportRequest(BaseModel):
-    # 압축 리허설처럼 측정 시간이 짧을 때 기대 샘플 수를 낮춰 잡기 위한 값.
-    # 지정하지 않으면 설정값(위치당 30개)을 쓴다.
+    # 압축 리허설 등 측정이 짧을 때 기대 샘플 수를 낮추는 값(미지정 시 설정값).
     expected_samples: int | None = None
 
 
@@ -161,6 +160,7 @@ async def health() -> dict[str, object]:
         "mqtt": mqtt_bridge.status() if mqtt_bridge else {"connected": False},
         "enable_realtime": settings.enable_realtime,
         "window_size_ms": settings.window_size_ms,
+        "window_grace_ms": settings.window_grace_ms,
         "experiment_id": sessions.experiment_id,
         "project_root": str(PROJECT_ROOT),
         "experiment_db": str(store.db_path),
@@ -186,17 +186,12 @@ async def set_node_meta(meta: NodeMeta) -> dict[str, object]:
     await db.upsert_node_meta(meta.model_dump())
     return {"ok": True, "node_id": meta.node_id}
 
-# ----------------------------------------------------------------------
-# 논문 실험 API (7/23 강의실 측정)
-# ----------------------------------------------------------------------
+# -- 논문 실험 API (7/23 강의실 측정) --
 
 @app.post("/experiment/start")
 async def experiment_start(body: ExperimentStart) -> dict[str, object]:
-    # 실험 시작 버튼을 누를 때마다 입력한 이름 뒤에 실행 시각을 붙여
-    # 매번 새로운 experiment_id 를 만든다. 그러면:
-    #   - 이전 실험 폴더는 그대로 남고 (experiments/<이전id>/)
-    #   - 이번 실험은 새 폴더(experiments/<새id>/)에 저장된다.
-    # 예: classroom_20260723  ->  classroom_20260723_213045
+    # 실험 시작마다 이름 뒤에 실행 시각을 붙여 새 experiment_id 를 만든다.
+    # (이전 실험 폴더는 남고 이번 실험은 새 폴더에 저장됨)
     base = body.experiment_id.strip() or "experiment"
     run_id = f"{base}_{time.strftime('%H%M%S')}"
     return sessions.start_experiment(run_id, body.ap_bssid,

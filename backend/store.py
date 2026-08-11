@@ -1,11 +1,8 @@
-"""논문 실험 데이터 저장소.
+"""논문 실험 데이터 저장소 (계획서 §12 저장 실패 대응).
 
-설계 원칙 (계획서 §12 "Backend 저장 실패" 대응):
-  1. 수신한 모든 JSON 줄을 즉시 JSONL 파일에 append 한다. 어떤 단계가 실패해도 원본은 남는다.
-  2. 실험 데이터는 SQLite 파일에 저장한다. Docker/Postgres 가 없어도 7/23 현장 측정이 가능하다.
-  3. 기존 Postgres 실시간 경로는 그대로 병행 동작하되, 실험 결과의 기준(source of truth)은 아니다.
-
-SQLite 는 5노드 × 1Hz 수준의 부하에서 충분하며, 파일 하나를 그대로 백업/전달할 수 있다.
+- 수신 JSON은 즉시 JSONL 에 append (어떤 단계가 실패해도 원본 보존)
+- 실험 데이터의 기준(source of truth)은 SQLite 파일 (Postgres 없이도 현장 측정 가능)
+- 기존 Postgres 실시간 경로는 병행하되 기준 저장소는 아니다
 """
 
 from __future__ import annotations
@@ -41,11 +38,9 @@ class ExperimentStore:
         with self._lock:
             self._conn.close()
 
-    # ------------------------------------------------------------------
-    # 원본 백업: 세션 활성 여부와 무관하게 모든 수신 메시지를 남긴다.
-    # ------------------------------------------------------------------
     def append_jsonl(self, topic: str, payload: str, receive_ms: int,
                      session_id: str | None, point_id: str | None) -> None:
+        """원본 백업: 세션 활성 여부와 무관하게 모든 수신 메시지를 남긴다."""
         line = json.dumps(
             {
                 "recv_ms": receive_ms,
@@ -63,9 +58,7 @@ class ExperimentStore:
         except OSError:
             logger.exception("jsonl append failed")
 
-    # ------------------------------------------------------------------
-    # experiment / session
-    # ------------------------------------------------------------------
+    # -- experiment / session ------------------------------------------
     def create_experiment(self, experiment_id: str, started_at_ms: int,
                           ap_bssid: str | None, ap_channel: int | None,
                           note: str | None = None) -> None:
@@ -96,8 +89,7 @@ class ExperimentStore:
                        point_role: str, started_at_ms: int, planned_seconds: int,
                        note: str | None = None) -> None:
         with self._lock:
-            # 같은 위치를 다시 측정하면 이전 세션들을 superseded 로 표시한다.
-            # 원본은 지우지 않고, 대표값 계산에서만 최신 세션을 쓴다.
+            # 같은 위치 재측정 시 이전 세션을 superseded 로 표시(원본은 유지, 대표값만 최신 세션)
             self._conn.execute(
                 """UPDATE session SET superseded = 1
                    WHERE experiment_id = ? AND point_id = ? AND superseded = 0""",
@@ -122,7 +114,7 @@ class ExperimentStore:
             self._conn.commit()
 
     def discard_session(self, session_id: str) -> None:
-        """측정을 망친 경우: 세션을 superseded 로 내리고 이전 세션을 되살린다."""
+        """측정 실패 시: 세션을 superseded 로 내리고 이전 세션을 되살린다."""
         with self._lock:
             row = self._conn.execute(
                 "SELECT experiment_id, point_id FROM session WHERE session_id = ?",
@@ -160,9 +152,7 @@ class ExperimentStore:
             (experiment_id,),
         )
 
-    # ------------------------------------------------------------------
-    # measurement
-    # ------------------------------------------------------------------
+    # -- measurement ---------------------------------------------------
     def insert_measurements(self, rows: Iterable[dict[str, Any]]) -> int:
         records = [
             (
@@ -189,7 +179,7 @@ class ExperimentStore:
         return len(records)
 
     def session_progress(self, session_id: str) -> list[dict[str, Any]]:
-        """현장에서 '이 노드가 지금 몇 개 들어왔나'를 보기 위한 집계."""
+        """현장에서 '이 노드가 지금 몇 개 들어왔나' 집계."""
         return self._query(
             """SELECT node_id,
                       COUNT(*)                                   AS total,
@@ -205,8 +195,8 @@ class ExperimentStore:
 
     def measurements_for_export(self, experiment_id: str,
                                 only_current: bool = True) -> list[dict[str, Any]]:
-        # 재측정으로 폐기된 세션에서는 '그 세션이 대상으로 삼은 위치'의 행만 제외한다.
-        # 같은 시간에 흘러들어온 고정 보정 센서의 데이터까지 버릴 이유는 없다.
+        # 폐기된 세션에서는 '그 세션의 대상 위치' 행만 제외한다. 같은 시간에 들어온
+        # 고정 보정 센서 데이터까지 버리지 않는다.
         clause = "AND NOT (s.superseded = 1 AND m.point_id = s.point_id)" if only_current else ""
         return self._query(
             f"""SELECT m.*, s.superseded, s.started_at_ms AS session_started_ms,
@@ -222,9 +212,7 @@ class ExperimentStore:
             (experiment_id,),
         )
 
-    # ------------------------------------------------------------------
-    # node_assignment
-    # ------------------------------------------------------------------
+    # -- node_assignment -----------------------------------------------
     def upsert_assignment(self, experiment_id: str, node_id: str, point_id: str,
                           point_role: str, updated_at_ms: int) -> None:
         with self._lock:
@@ -245,9 +233,7 @@ class ExperimentStore:
             (experiment_id,),
         )
 
-    # ------------------------------------------------------------------
-    # point / offset / tx
-    # ------------------------------------------------------------------
+    # -- point / offset / tx -------------------------------------------
     def upsert_point(self, experiment_id: str, point_id: str, point_role: str | None,
                      pos_x: float | None, pos_y: float | None, pos_z: float | None,
                      note: str | None, updated_at_ms: int) -> None:
@@ -319,7 +305,6 @@ class ExperimentStore:
             "SELECT * FROM tx WHERE experiment_id = ? ORDER BY tx_id", (experiment_id,)
         )
 
-    # ------------------------------------------------------------------
     def _query(self, sql: str, params: tuple = ()) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._conn.execute(sql, params).fetchall()

@@ -39,8 +39,7 @@ class MqttBridge:
         self.metrics = metrics
         self.store = store
         self.sessions = sessions
-        # 브로커 연결 상태. 현장에서 "샘플이 안 들어오는 이유"를 구분하려면 필요하다.
-        # (브로커가 죽은 것인지, ESP32 가 죽은 것인지)
+        # 연결 상태: "샘플이 안 들어오는 이유"(브로커 죽음 vs ESP32 죽음)를 구분하려면 필요
         self.connected = False
         self.connect_count = 0
         self.disconnect_count = 0
@@ -66,8 +65,7 @@ class MqttBridge:
         self.connected = True
         self.connect_count += 1
         self.last_connected_ms = now_ms()
-        # 재연결 시에도 구독을 다시 걸어야 한다. 브로커가 재시작되면 세션이 사라지므로
-        # 여기서 다시 subscribe 하지 않으면 연결은 살아 있는데 메시지가 오지 않는다.
+        # 재연결 시 구독을 다시 걸어야 한다(안 걸면 연결은 살아있는데 메시지가 안 옴).
         client.subscribe("rssi/#")
         client.subscribe("gateway/#")
         client.subscribe("status/+/lwt")
@@ -103,8 +101,7 @@ class MqttBridge:
     async def handle_message(self, topic: str, payload: bytes) -> None:
         receive_ms = now_ms()
 
-        # 비상 경로 (계획서 §12): 파싱 성공 여부와 무관하게 원본을 먼저 남긴다.
-        # MQTT 이후 어느 단계가 실패해도 이 파일만 있으면 데이터를 복구할 수 있다.
+        # 비상 경로(§12): 파싱 성공 여부와 무관하게 원본을 먼저 JSONL 에 남긴다.
         if self.store is not None and not topic.endswith("/lwt"):
             active = self.sessions.active() if self.sessions else None
             self.store.append_jsonl(
@@ -163,12 +160,7 @@ class MqttBridge:
             await self._ingest(measurement, receive_ms, server_dt)
 
     async def _ingest(self, measurement: dict[str, Any], receive_ms: int, server_dt: datetime) -> None:
-        """측정값 1건을 실험 저장소 + 실시간 파이프라인에 투입.
-
-        범위를 벗어난 값도 실험 저장소에는 valid=0 으로 기록한다.
-        계획서 §7.2 는 "Raw 데이터 보존"과 "비정상 RSSI 범위 제외"를 함께 요구하므로,
-        저장 단계에서 버리지 않고 분석 단계에서 제외하는 방식을 쓴다.
-        """
+        """측정 1건을 실험 저장소 + 실시간 파이프라인에 투입. 범위 밖 값도 valid=0 으로 기록(§7.2)."""
         self._record_experiment(measurement, receive_ms)
 
         if not measurement["valid"]:
@@ -190,11 +182,10 @@ class MqttBridge:
         active = self.sessions.active()
         if active is None:
             return
-        # 세션 마감 시각을 넘겨 도착한 샘플은 그 위치의 30초 창에 속하지 않는다.
+        # 세션 마감 시각을 넘겨 도착한 샘플은 그 위치의 창에 속하지 않는다.
         if receive_ms > active.deadline_ms:
             return
-        # 위치는 세션 라벨이 아니라 '이 노드가 지금 어디에 놓여 있는지'로 정한다.
-        # 고정 보정 센서 4대는 모든 세션 동안 각자의 보정 위치 데이터를 계속 쌓는다.
+        # 위치는 세션 라벨이 아니라 노드의 현재 배치로 정한다(고정 센서는 매 세션 누적).
         point_id, point_role = self.sessions.resolve(measurement["node_id"], active)
         self.store.insert_measurements([{
             "experiment_id": active.experiment_id,
@@ -216,7 +207,7 @@ class MqttBridge:
         }])
 
     def _validate_measurement(self, data: dict[str, Any], receive_ms: int) -> dict[str, Any] | None:
-        """파싱은 backend/parsing.py 의 순수 함수에 위임한다 (브로커 없이 테스트 가능)."""
+        """파싱은 parsing.py 순수 함수에 위임(브로커 없이 테스트 가능)."""
         return parse_measurement(data, receive_ms, ParseConfig(
             rssi_min=self.settings.rssi_min,
             rssi_max=self.settings.rssi_max,

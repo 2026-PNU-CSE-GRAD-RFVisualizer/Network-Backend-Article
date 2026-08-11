@@ -1,9 +1,6 @@
-"""CSV Export 및 그래픽스 파트 전달 산출물 생성.
+"""CSV Export 및 그래픽스 전달 산출물 생성 (계획서 §7.3, §10 디렉터리 구조).
 
-계획서 §7.3 (measurements_raw.csv / measurements_summary.csv),
-§10 7월 26일 최종 산출물 디렉터리 구조를 따른다.
-
-그래픽스 파트는 이 디렉터리만 받아서 바로 IDW / Residual IDW 를 돌릴 수 있어야 한다.
+그래픽스 파트는 이 디렉터리만 받아 바로 IDW / Residual IDW 를 돌릴 수 있어야 한다.
 """
 
 from __future__ import annotations
@@ -43,7 +40,7 @@ def _iso(ms: int | None) -> str:
 
 
 def _quantile(values: list[float], q: float) -> float:
-    """선형 보간 분위수. numpy 의존 없이 계산한다."""
+    """선형 보간 분위수 (numpy 의존 없음)."""
     if not values:
         return 0.0
     ordered = sorted(values)
@@ -57,11 +54,7 @@ def _quantile(values: list[float], q: float) -> float:
 
 
 def summarize(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """(point_id, node_id) 단위 대표값 계산.
-
-    대표 RSSI 는 계획서 §3.3 에 따라 Filtered RSSI 의 중앙값을 사용하고,
-    corrected_rssi = median_filtered + device_offset_db 로 장치 편차를 보정한다.
-    """
+    """(point_id, node_id) 대표값. corrected_rssi = median_filtered + device_offset_db (§3.3)."""
     groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for r in rows:
         if r["valid"] != 1:
@@ -105,7 +98,7 @@ def quality_check(rows: list[dict[str, Any]], summary: list[dict[str, Any]],
                   expected_samples: int, offsets: list[dict[str, Any]],
                   points: list[dict[str, Any]],
                   tx_list: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-    """현장을 떠나기 전에 확인해야 할 항목을 기계적으로 점검한다."""
+    """현장을 떠나기 전 확인할 항목을 기계적으로 점검한다."""
     problems: list[str] = []
     warnings: list[str] = []
 
@@ -126,7 +119,7 @@ def quality_check(rows: list[dict[str, Any]], summary: list[dict[str, Any]],
         no_offset = sorted({s["node_id"] for s in summary if s["device_offset_db"] is None})
         if no_offset:
             problems.append(f"offset 값이 없는 노드: {', '.join(no_offset)}")
-        # 5대를 한 자리에 두고 동시에 측정했다면 샘플 수가 비슷해야 한다.
+        # 한 자리에서 동시 측정했다면 노드별 샘플 수가 비슷해야 한다.
         counts = [o["sample_count"] for o in offsets if o["sample_count"]]
         if counts and max(counts) > min(counts) * 1.5:
             warnings.append(
@@ -209,10 +202,8 @@ def export_experiment(store: ExperimentStore, experiment_id: str,
         writer.writeheader()
         writer.writerows(summary)
 
-    # 역할별로 대표값(summary)을 분리해 저장한다.
-    # offset / calibration / test 세 역할을 각각 별도 파일로 만들어
-    # 그래픽스 파트가 필요한 역할만 골라 쓸 수 있게 한다.
-    #   calibration_points.csv, test_points.csv 는 기존 이름을 유지(하위 호환).
+    # 역할별 분리: 그래픽스가 필요한 역할만 골라 쓰게 한다.
+    # calibration_points.csv, test_points.csv 는 기존 이름 유지(하위 호환).
     role_files = {
         "offset": "offset_points.csv",
         "calibration": "calibration_points.csv",
@@ -225,7 +216,7 @@ def export_experiment(store: ExperimentStore, experiment_id: str,
             writer.writeheader()
             writer.writerows([s for s in summary if s["point_role"] == role])
 
-    # 원본 시계열도 역할별로 분리해 by_role/ 폴더에 저장한다.
+    # 원본 시계열도 역할별로 raw/by_role/ 에 분리 저장.
     by_role_dir = root / "raw" / "by_role"
     by_role_dir.mkdir(parents=True, exist_ok=True)
     for role in role_files:
@@ -359,11 +350,7 @@ p 를 고르려면 `calibration_points.csv` 안에서 Leave-One-Out 으로만 �
 
 def import_points_csv(store: ExperimentStore, experiment_id: str,
                       csv_text: str, updated_at_ms: int) -> dict[str, Any]:
-    """현장에서 종이에 적어온 좌표를 일괄 등록한다.
-
-    헤더: point_id, point_role, pos_x, pos_y, pos_z, note
-    (x/y/z 로 써도 인식한다.)
-    """
+    """종이에 적어온 좌표를 일괄 등록. 헤더: point_id, point_role, pos_x/y/z, note (x/y/z 도 인식)."""
     reader = csv.DictReader(csv_text.lstrip("﻿").splitlines())
     imported, errors = [], []
 
