@@ -56,6 +56,7 @@ def _run_offset(store, mgr):
         for n in NODES:
             ingest(store, mgr, n, t + i * 1000, BASE + TRUE_BIAS[n])
     mgr.stop_offset_run()
+    compute_device_offsets(store, "exp1", off["offset_run_id"])  # 사전 offset 계산(run 전제)
     return off["offset_run_id"]
 
 

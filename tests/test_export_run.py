@@ -137,6 +137,40 @@ def test_export_files_and_contents():
         store.close()
 
 
+def test_qc_fails_when_calibration_missing():
+    """C1~C4 동시간 데이터가 없는 Test 구간은 QC 실패여야 한다(리뷰 재현)."""
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        store = ExperimentStore(Path(tmp) / "data")
+        mgr = ExperimentManager(store)
+        mgr.start_experiment("exp1", "aa", 6)
+        for n in NODES:
+            mgr.assign(n, "offset-00", "offset")
+        off = mgr.start_offset_run("pre")
+        t = 1_700_000_000_000
+        for i in range(20):
+            for n in NODES:
+                ingest(store, mgr, n, t + i * 50, BASE + BIAS[n])
+        mgr.stop_offset_run()
+        compute_device_offsets(store, "exp1", off["offset_run_id"])
+
+        mgr.assign("nt", "T-move", "test")
+        store.upsert_point("exp1", "T1", "test", 2.0, 2.0, 0.8, None, t)
+        store.upsert_tx("exp1", "tx-01", 7.0, 1.5, 1.2, 2_400_000_000, "aa", 6, None)
+
+        mgr.start_run("forward", 1)
+        seg = mgr.prepare_test_segment("T1", 1, 0, 2)
+        rs = seg["recording_started_at_ms"]
+        for k in range(3):                       # T 만 저장, C1~C4 는 저장하지 않음
+            ingest(store, mgr, "nt", rs + k * 300, BASE + BIAS["nt"])
+        mgr.finish_test_segment()
+
+        out = export_experiment(store, "exp1", Path(tmp) / "out",
+                                expected_samples=3, expected_test_points=1)
+        assert out["qc"]["ok"] is False
+        assert any("C1~C4" in p for p in out["qc"]["problems"]), out["qc"]["problems"]
+        store.close()
+
+
 if __name__ == "__main__":
     import traceback
 

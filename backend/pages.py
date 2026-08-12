@@ -57,6 +57,10 @@ MEASURE_HTML = """<!doctype html>
     <button class="warn" id="btnStop" onclick="stopSegment()">현재 Test 즉시 종료</button>
     <button class="err" id="btnDiscard" onclick="discardSegment()">버리고 재측정</button>
   </div>
+  <div class="row" style="justify-content:center;margin-top:4px">
+    <input id="remeasurePoint" placeholder="완료 위치 재측정 (예: T4)" size="12">
+    <button onclick="remeasure()">이 위치 재측정</button>
+  </div>
   <div class="done" id="donePoints" style="margin-top:10px"></div>
 </div>
 
@@ -95,9 +99,11 @@ MEASURE_HTML = """<!doctype html>
 
   <h2>장비 편차(Offset)</h2>
   <div class="row">
-    <button onclick="offsetStart()">Offset 측정 시작</button>
-    <button onclick="offsetStop()">Offset 측정 종료</button>
-    <button onclick="offsetCompute()">Offset 계산</button>
+    <select id="offsetPhase"><option value="pre">사전(pre)</option><option value="post">사후(post)</option></select>
+    <button onclick="offsetStart()">측정 시작</button>
+    <button onclick="offsetStop()">종료</button>
+    <button onclick="offsetCompute()">계산</button>
+    <button onclick="attachPost()">사후를 Run에 연결</button>
     <small id="offsetState">-</small>
   </div>
 
@@ -161,10 +167,20 @@ async function assignAll(){
     note('expState','배정 완료', true);
   }catch(e){ note('expState',e.message,false);} }
 
-async function offsetStart(){ try{ await api('/offset-run/start',{}); note('offsetState','Offset 측정 중...',true);}catch(e){note('offsetState',e.message,false);} }
+let lastPostOffsetId = null;
+function offPhase(){ return document.getElementById('offsetPhase').value; }
+async function offsetStart(){ try{ await api('/offset-run/start',{phase:offPhase()}); note('offsetState',offPhase()+' Offset 측정 중...',true);}catch(e){note('offsetState',e.message,false);} }
 async function offsetStop(){ try{ await api('/offset-run/stop',{}); note('offsetState','Offset 측정 종료',true);}catch(e){note('offsetState',e.message,false);} }
-async function offsetCompute(){ try{ const d=await api('/experiment/offsets/compute',{});
-  note('offsetState', d.ok?('offset 계산 완료: '+d.nodes.length+'대'):d.reason, d.ok);}catch(e){note('offsetState',e.message,false);} }
+async function offsetCompute(){ try{ const d=await api('/experiment/offsets/compute',{phase:offPhase()});
+  if(d.ok && offPhase()==='post') lastPostOffsetId=d.offset_run_id;
+  note('offsetState', d.ok?(offPhase()+' offset 계산 완료: '+d.nodes.length+'대'):d.reason, d.ok);}catch(e){note('offsetState',e.message,false);} }
+async function attachPost(){ if(!lastPostOffsetId){ note('offsetState','먼저 사후(post) 측정·계산을 하세요',false); return; }
+  try{ await api('/run/attach-post-offset',{offset_run_id:lastPostOffsetId}); note('offsetState','사후 Offset 을 Run 에 연결(drift용)',true);}catch(e){note('offsetState',e.message,false);} }
+async function remeasure(){ const p=document.getElementById('remeasurePoint').value.trim();
+  if(!p){ alert('재측정할 위치(예: T4)를 입력하세요'); return; }
+  const n=parseInt(p.replace(/[^0-9]/g,''))||1;
+  try{ await api('/test-segment/prepare',{point_id:p, order_index:n, stabilization_seconds:cfg.stab, recording_seconds:cfg.rec}); }
+  catch(e){ alert('재측정 시작 실패: '+e.message); } }
 
 async function setTx(){ try{ await api('/experiment/tx',{tx_id:'tx-01',
     pos_x:parseFloat(document.getElementById('txx').value),
@@ -249,10 +265,12 @@ function render(s){
 
   // 노드 그리드
   const nodes=[...(s.calibration_nodes||[])]; if(s.test_node && s.test_node.node_id) nodes.push({...s.test_node,_t:true});
-  document.getElementById('nodeGrid').innerHTML = nodes.map(n=>
-    '<div class="kv"><div class="l">'+(n._t?'T ':'')+ (n.point_id||'') +' · '+n.node_id+'</div>'+
-    '<div class="v '+(n.online?'on':'off')+'">'+(n.online?'ONLINE':'OFFLINE')+'</div></div>').join('')
-    || '<small class="muted">배정된 센서 없음</small>';
+  document.getElementById('nodeGrid').innerHTML = nodes.map(n=>{
+    const gap = n.gap_ms==null ? '-' : (n.gap_ms>5000?('⚠'+Math.round(n.gap_ms/1000)+'s'):(Math.round(n.gap_ms/1000)+'s'));
+    return '<div class="kv"><div class="l">'+(n._t?'T ':'')+(n.point_id||'')+' · '+n.node_id+'</div>'+
+      '<div class="v '+(n.online?'on':'off')+'">'+(n.online?'ONLINE':'OFFLINE')+'</div>'+
+      '<div class="l">샘플 '+(n.samples||0)+' · 공백 '+gap+'</div></div>';
+  }).join('') || '<small class="muted">배정된 센서 없음</small>';
 }
 
 async function tick(){

@@ -9,12 +9,31 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from backend.experiment import Conflict, ExperimentManager  # noqa: E402
+from backend.experiment import compute_device_offsets  # noqa: E402
 from backend.store import ExperimentStore  # noqa: E402
+
+
+def _pre_offset(store, mgr):
+    """start_run 전제인 사전 Offset 을 준비한다."""
+    off = mgr.start_offset_run("pre")
+    t = 1_700_000_000_000
+    for i in range(10):
+        for node in ["n1", "n2", "n3", "n4", "nt"]:
+            ctx = mgr.offset_context(node)
+            store.insert_measurements([{
+                "experiment_id": "exp1", "session_id": ctx["run_id"],
+                "run_id": ctx["run_id"], "segment_id": None,
+                "point_id": ctx["point_id"], "point_role": "offset",
+                "node_id": node, "server_ts_ms": t + i * 50, "node_ts_ms": t + i * 50,
+                "rssi_filtered_dbm": -60.0, "valid": True}])
+    mgr.stop_offset_run()
+    compute_device_offsets(store, "exp1", off["offset_run_id"])
 
 
 def _mgr(tmp):
@@ -25,6 +44,7 @@ def _mgr(tmp):
     for node, pt in [("n1", "C1"), ("n2", "C2"), ("n3", "C3"), ("n4", "C4")]:
         mgr.assign(node, pt, "calibration")
     mgr.assign("nt", "T-move", "test")
+    _pre_offset(store, mgr)   # start_run 이 사전 Offset 을 요구함
     return store, mgr
 
 
@@ -127,16 +147,35 @@ def test_time_matching_calibration_and_test():
 
 
 def test_delayed_sample_still_matches_segment_by_time():
-    """자동 종료 후 지연 도착해도 ts 가 기록창 안이면 그 Segment 로 판정."""
+    """자동 완료(자연 종료) 후 지연 도착해도 ts 가 기록창 안이면 그 Segment 로 판정."""
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         store, mgr = _mgr(tmp)
         mgr.start_run("forward", 1)
-        seg = mgr.prepare_test_segment("T1", 1, 20, 120)
+        seg = mgr.prepare_test_segment("T1", 1, 0, 2)   # 안정화 0, 기록 2s
         mid = (seg["recording_started_at_ms"] + seg["recording_ended_at_ms"]) // 2
-        mgr.finish_test_segment()  # 활성 Segment 없음
-        # 활성 포인터는 없지만 시간으로 판정되어야 한다
+        time.sleep(2.1)
+        fin = mgr.auto_advance_segment()                # 자연 종료(창 절단 없음)
+        assert fin is not None and mgr.active_test_segment() is None
+        # 활성 포인터는 없지만 시간 범위로 판정되어야 한다
         t_delayed = mgr.context_at("nt", mid)
         assert t_delayed is not None and t_delayed["segment_id"] == seg["segment_id"]
+        store.close()
+
+
+def test_early_stop_truncates_recording_window():
+    """조기 종료하면 기록창이 종료 시각으로 절단되어, 이후 데이터가 이 T 에 오염되지 않는다."""
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        store, mgr = _mgr(tmp)
+        mgr.start_run("forward", 1)
+        seg = mgr.prepare_test_segment("T1", 1, 0, 120)  # 계획 2분
+        orig_end = seg["recording_ended_at_ms"]
+        time.sleep(0.2)
+        mgr.finish_test_segment()                        # 조기 종료
+        row = store.get_test_segment(seg["segment_id"])
+        assert row["recording_ended_at_ms"] < orig_end   # 창이 줄었다
+        # 원래 창 후반(mid) 시각의 T 샘플은 이제 이 Segment 에 안 붙는다
+        mid = (seg["recording_started_at_ms"] + orig_end) // 2
+        assert mgr.context_at("nt", mid) is None
         store.close()
 
 

@@ -115,6 +115,12 @@ class ExperimentManager:
 
     def start_experiment(self, experiment_id: str, ap_bssid: str | None,
                          ap_channel: int | None, note: str | None = None) -> dict[str, Any]:
+        # 이미 진행 중인 Run/Segment 가 있으면 조용히 덮어쓰지 않는다(§22).
+        # 고아 Run(DB running 잔존)을 막기 위해 열린 Run/Segment 를 interrupted 로 정리한다.
+        interrupted = self.store.mark_all_open_interrupted(now_ms())
+        if interrupted["runs"] or interrupted["segments"]:
+            logger.warning("새 실험 시작 전 열린 Run/Segment 를 interrupted 로 정리: %s", interrupted)
+
         self.store.create_experiment(experiment_id, now_ms(), ap_bssid, ap_channel, note)
         restored = {
             a["node_id"]: (a["point_id"], a["point_role"])
@@ -129,7 +135,19 @@ class ExperimentManager:
             self._active_offset = None
             self._assignments = restored
         logger.info("experiment started: %s (%d assignments restored)", experiment_id, len(restored))
-        return {"experiment_id": experiment_id, "assignments_restored": len(restored)}
+        return {"experiment_id": experiment_id, "assignments_restored": len(restored),
+                "interrupted": interrupted}
+
+    def end_experiment(self) -> dict[str, Any]:
+        with self._lock:
+            experiment_id = self._experiment_id
+            self._active_run = None
+            self._active_test_segment = None
+            self._active_offset = None
+        if experiment_id:
+            self.store.end_experiment(experiment_id, now_ms())
+        logger.info("experiment ended: %s", experiment_id)
+        return {"experiment_id": experiment_id, "ended": bool(experiment_id)}
 
     def _require_experiment(self) -> str:
         if self._experiment_id is None:
@@ -200,10 +218,20 @@ class ExperimentManager:
         exp = self._require_experiment()
         if direction not in DIRECTIONS:
             raise ValueError(f"direction 은 {DIRECTIONS} 중 하나여야 합니다.")
-        # 사전 Offset 이 지정되지 않으면 이 실험의 최신 완료된 pre OffsetRun 을 적용한다.
+        if not isinstance(pass_index, int) or pass_index < 1:
+            raise ValueError("pass_index 는 1 이상의 정수여야 합니다.")
+        # 사전 Offset 이 지정되지 않으면, device_offset 계산이 끝난 최신 pre OffsetRun 을 고른다.
         if pre_offset_run_id is None:
-            pre = self.store.latest_offset_run(exp, "pre")
-            pre_offset_run_id = pre["offset_run_id"] if pre else None
+            for orr in reversed(self.store.list_offset_runs(exp)):
+                if (orr["phase"] == "pre" and orr["status"] == "completed"
+                        and self.store.list_device_offsets(exp, orr["offset_run_id"])):
+                    pre_offset_run_id = orr["offset_run_id"]
+                    break
+        # 사전 Offset 없이는 본 실험 Run 을 시작할 수 없다(corrected_rssi 근거가 없음).
+        if pre_offset_run_id is None:
+            raise Conflict("사전(pre) Offset 측정·계산을 먼저 완료하세요.")
+        if not self.store.list_device_offsets(exp, pre_offset_run_id):
+            raise Conflict("지정한 사전 Offset 이 아직 계산되지 않았습니다. Offset 계산을 먼저 실행하세요.")
         with self._lock:
             if self._active_offset is not None:
                 raise Conflict("Offset 측정 중에는 본 실험 Run 을 시작할 수 없습니다.")
@@ -256,6 +284,12 @@ class ExperimentManager:
         point_id = point_id.strip()
         if not point_id:
             raise ValueError("point_id 가 비어 있습니다.")
+        if stabilization_seconds < 0:
+            raise ValueError("stabilization_seconds 는 0 이상이어야 합니다.")
+        if recording_seconds <= 0:
+            raise ValueError("recording_seconds 는 1 이상이어야 합니다.")
+        if order_index < 1:
+            raise ValueError("order_index 는 1 이상이어야 합니다.")
         with self._lock:
             run = self._active_run
             if run is None:
@@ -280,13 +314,20 @@ class ExperimentManager:
             return self._active_test_segment
 
     def finish_test_segment(self) -> dict[str, Any]:
-        """정상 완료(2분 도달 또는 즉시 종료). 저장된 시간 범위는 유지한다."""
+        """완료(2분 도달 또는 즉시 종료).
+
+        즉시 종료(계획 종료 시각 전)면 기록 구간 끝을 종료 시각으로 절단한다.
+        그러지 않으면 종료 후 이동 중 도착한 데이터가 이 T 위치로 잘못 저장될 수 있다.
+        """
+        cur = now_ms()
         with self._lock:
             seg = self._active_test_segment
             self._active_test_segment = None
         if seg is None:
             return {"finished": False}
-        self.store.set_segment_status(seg.segment_id, "completed", now_ms())
+        if cur < seg.recording_ended_at_ms:
+            self.store.truncate_segment_recording(seg.segment_id, cur)  # 조기 종료: 창 절단
+        self.store.set_segment_status(seg.segment_id, "completed", cur)
         logger.info("segment finish: %s", seg.point_id)
         return {"finished": True, "segment": seg.to_dict()}
 

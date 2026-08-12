@@ -386,6 +386,18 @@ class ExperimentStore:
                 "UPDATE test_segment SET superseded = 1 WHERE segment_id = ?", (segment_id,))
             self._conn.commit()
 
+    def truncate_segment_recording(self, segment_id: str, ended_ms: int) -> None:
+        """조기 종료 시 기록 구간 끝을 앞당긴다. 이후 도착 데이터가 이 Segment 에 오염되지 않게 함.
+
+        (segment_for_timestamp 가 recording_ended_at_ms 로 판정하므로 창을 줄여야 안전.)
+        이미 더 이른 값이면 유지한다.
+        """
+        with self._lock:
+            self._conn.execute(
+                "UPDATE test_segment SET recording_ended_at_ms = MIN(recording_ended_at_ms, ?) "
+                "WHERE segment_id = ?", (ended_ms, segment_id))
+            self._conn.commit()
+
     def get_test_segment(self, segment_id: str) -> dict[str, Any] | None:
         rows = self._query("SELECT * FROM test_segment WHERE segment_id = ?", (segment_id,))
         return rows[0] if rows else None
@@ -402,6 +414,15 @@ class ExperimentStore:
             "SELECT * FROM test_segment WHERE run_id = ? ORDER BY order_index, attempt_index",
             (run_id,),
         )
+
+    def run_node_stats(self, run_id: str) -> dict[str, dict[str, Any]]:
+        """현재 Run 의 노드별 누적 샘플 수·마지막 수신 시각(상태 화면용)."""
+        rows = self._query(
+            """SELECT node_id, COUNT(*) AS samples, MAX(server_ts_ms) AS last_ms
+                 FROM measurement WHERE run_id = ? GROUP BY node_id""",
+            (run_id,),
+        )
+        return {r["node_id"]: {"samples": r["samples"], "last_ms": r["last_ms"]} for r in rows}
 
     def segment_for_timestamp(self, run_id: str, server_ts_ms: int) -> dict[str, Any] | None:
         """server_ts_ms 가 [recording_started, recording_ended) 안에 드는 기록 Segment.

@@ -238,7 +238,9 @@ def quality_check(rows, test_points, cal_window, pre_offsets, post_offsets, poin
         segs = [s for s in segments if s["run_id"] == rid
                 and s["status"] == "completed" and not s["superseded"]]
         pts = [s["point_id"] for s in sorted(segs, key=lambda s: s["order_index"])]
-        if len(pts) != expected_test_points:
+        if len(pts) < expected_test_points:
+            problems.append(f"[{rid}] Test 위치 {len(pts)}개 (기대 {expected_test_points}) — 부족")
+        elif len(pts) > expected_test_points:
             warnings.append(f"[{rid}] Test 위치 {len(pts)}개 (기대 {expected_test_points})")
         # 방향 순서
         nums = [int(p[1:]) for p in pts if p[1:].isdigit()]
@@ -265,12 +267,16 @@ def quality_check(rows, test_points, cal_window, pre_offsets, post_offsets, poin
     for s in segments:
         if s["status"] != "completed" or s["superseded"]:
             continue
+        n_cal = len(cal_nodes_by_seg.get(s["segment_id"], set()))
         if s["segment_id"] not in tp_by_seg:
             problems.append(f"Segment {s['segment_id']}({s['point_id']}) 에 T 데이터가 없습니다.")
-        if len(cal_nodes_by_seg.get(s["segment_id"], set())) < expected_calibration_nodes:
-            warnings.append(f"Segment {s['segment_id']}({s['point_id']}) 에 C1~C4 일부가 없습니다.")
+        # 동시간 C1~C4 누락은 후처리를 못 하므로 실패 처리(경고 아님).
+        if n_cal == 0:
+            problems.append(f"Segment {s['segment_id']}({s['point_id']}) 에 동시간 C1~C4 데이터가 전혀 없습니다.")
+        elif n_cal < expected_calibration_nodes:
+            problems.append(f"Segment {s['segment_id']}({s['point_id']}) 에 C1~C4 중 {n_cal}개만 있습니다.")
 
-    # 좌표·BSSID
+    # 좌표·BSSID·채널
     missing_coords = sorted({t["point_id"] for t in test_points if t["x"] is None})
     if missing_coords:
         problems.append(f"좌표 미등록 Test 위치: {', '.join(missing_coords)}")
@@ -279,21 +285,48 @@ def quality_check(rows, test_points, cal_window, pre_offsets, post_offsets, poin
     bssids = {r["ap_bssid"] for r in rows if r["ap_bssid"]}
     if len(bssids) > 1:
         problems.append(f"여러 BSSID 가 섞였습니다: {', '.join(sorted(bssids))}")
+    used_rows = [r for r in rows if r["run_id"] and r["point_role"] in ("calibration", "test")]
+    n_missing_ch = sum(1 for r in used_rows if r["ap_channel"] is None)
+    if used_rows and n_missing_ch == len(used_rows):
+        warnings.append("모든 측정에 AP 채널이 비어 있습니다(센서 payload 확인 필요).")
+    elif n_missing_ch:
+        warnings.append(f"AP 채널이 비어 있는 측정 {n_missing_ch}건.")
 
-    # 샘플 부족
+    # 샘플 부족(기대의 60% 미만)은 통계 신뢰도를 해치므로 실패 처리.
     low = [f'{t["point_id"]}={t["sample_count"]}' for t in test_points
            if t["sample_count"] < expected_samples * 0.6]
     if low:
-        warnings.append(f"샘플 수 부족(기대 {expected_samples}의 60% 미만): {', '.join(low)}")
+        problems.append(f"샘플 수 부족(기대 {expected_samples}의 60% 미만): {', '.join(low)}")
+
+    # 노드별 최대 수신 공백(같은 Run 내 연속 server_ts 간격). 5초 초과 시 경고.
+    max_gap = _max_receive_gap(used_rows)
+    big_gaps = {n: g for n, g in max_gap.items() if g > 5000}
+    if big_gaps:
+        warnings.append("긴 수신 공백(>5s): "
+                        + ", ".join(f"{n}={g}ms" for n, g in sorted(big_gaps.items())))
 
     return {
         "ok": not problems, "problems": problems, "warnings": warnings,
         "offset_drift": drift,
+        "max_receive_gap_ms": max_gap,
+        "note": "MQTT 재연결 횟수는 런타임 지표라 Export QC 에 포함되지 않는다(endurance_monitor 로 기록).",
         "counts": {"raw_rows": len(rows), "runs": len(runs),
                    "completed_segments": len([s for s in segments
                                               if s["status"] == "completed" and not s["superseded"]]),
                    "test_points": len(test_points), "calibration_windows": len(cal_window)},
     }
+
+
+def _max_receive_gap(rows: list[dict[str, Any]]) -> dict[str, int]:
+    """(run 내) 노드별 연속 수신 server_ts 최대 간격(ms)."""
+    by_node: dict[str, list[int]] = {}
+    for r in rows:
+        by_node.setdefault(r["node_id"], []).append(int(r["server_ts_ms"]))
+    out = {}
+    for node, ts in by_node.items():
+        ts.sort()
+        out[node] = max((b - a for a, b in zip(ts, ts[1:])), default=0)
+    return out
 
 
 def _write_csv(path: Path, columns: list[str], rows: list[dict[str, Any]]) -> None:

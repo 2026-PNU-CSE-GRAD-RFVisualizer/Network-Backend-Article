@@ -290,11 +290,19 @@ async def run_current() -> dict[str, object]:
     run = sessions.active_run()
     seg = sessions.active_test_segment()
     experiment_id = sessions.experiment_id
+    snap = {n["node_id"]: n for n in registry.snapshot()}
+    node_stats = store.run_node_stats(run.run_id) if run is not None else {}
     cal_nodes, test_node = [], {}
     for node, (point, role) in sorted(sessions.assignments().items()):
+        rs = snap.get(node, {})
+        st = node_stats.get(node, {})
+        last_ms = st.get("last_ms") or rs.get("last_seen")
         entry = {"node_id": node, "point_id": point,
-                 "online": next((n["online"] for n in registry.snapshot()
-                                 if n["node_id"] == node), False)}
+                 "online": bool(rs.get("online")),
+                 "msg_rate_hz": rs.get("msg_rate_hz", 0.0),
+                 "samples": st.get("samples", 0),          # 이 Run 누적 저장 수
+                 "last_seen_ms": last_ms,
+                 "gap_ms": (cur - last_ms) if last_ms else None}  # 마지막 수신 후 경과(수신 공백)
         if role == "calibration":
             cal_nodes.append(entry)
         elif role == "test":

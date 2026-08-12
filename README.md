@@ -62,14 +62,19 @@ docker compose up -d
 | `GET /nodes/status`                | 노드별 online/전송빈도/손실 |
 | `GET /metrics`                     | 수집지연·드롭률 |
 | `POST /experiment/start` `/end`    | 실험 시작·종료 |
-| `POST /experiment/assign`          | 노드를 위치에 배치 |
+| `POST /experiment/assign`          | 노드 역할 배정(calibration/test) |
 | `POST /experiment/tx`              | AP(TX) 좌표 등록 |
-| `POST /session/start` `/stop`      | 30초 측정 세션 |
-| `GET /session/current`             | 진행 상황(측정 페이지가 폴링) |
-| `POST /experiment/points/import`   | 좌표 CSV 일괄 등록 |
+| `POST /offset-run/start` `/stop`   | 사전·사후 Offset 측정 (`{phase:"pre"\|"post"}`) |
 | `POST /experiment/offsets/compute` | 장치 편차 계산 |
+| `POST /run/start` `/end` · `GET /run/current` | 본 실험 Run(정/역방향) |
+| `POST /test-segment/prepare` `/stop` `/discard` | T 위치 안정화→기록 구간 |
+| `POST /run/attach-post-offset`     | 사후 Offset 을 Run 에 연결(drift) |
+| `POST /experiment/points/import`   | 좌표 CSV 일괄 등록 |
 | `POST /experiment/export`          | CSV 내보내기 + 품질 점검 |
 | `GET /experiment/download/{which}` | raw / summary / calibration / test |
+
+> 구 `POST /session/start` `/stop`, `GET /session/current` 는 **제거되어 HTTP 410 Gone** 을 반환한다.
+> 자세한 흐름은 `RUN_EXPERIMENT.md` 참고.
 
 `ENABLE_REALTIME=true` 일 때만 `GET /position/latest`, `WS /frames` 가 추가된다.
 
