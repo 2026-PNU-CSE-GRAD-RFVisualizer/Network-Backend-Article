@@ -81,10 +81,10 @@ class MqttBridge:
         self.connected = False
         self.disconnect_count += 1
         self.last_disconnected_ms = now_ms()
-        active = self.sessions.active() if self.sessions else None
-        if active is not None:
+        seg = self.sessions.active_test_segment() if self.sessions else None
+        if seg is not None:
             logger.error("mqtt DISCONNECTED 측정 중! point=%s — 이 위치는 재측정이 필요할 수 있다: %s",
-                         active.point_id, reason_code)
+                         seg.point_id, reason_code)
         else:
             logger.warning("mqtt disconnected: %s", reason_code)
 
@@ -106,13 +106,14 @@ class MqttBridge:
         # 비상 경로 (계획서 §12): 파싱 성공 여부와 무관하게 원본을 먼저 남긴다.
         # MQTT 이후 어느 단계가 실패해도 이 파일만 있으면 데이터를 복구할 수 있다.
         if self.store is not None and not topic.endswith("/lwt"):
-            active = self.sessions.active() if self.sessions else None
+            run = self.sessions.active_run() if self.sessions else None
+            seg = self.sessions.active_test_segment() if self.sessions else None
             self.store.append_jsonl(
                 topic,
                 payload.decode("utf-8", errors="replace"),
                 receive_ms,
-                active.session_id if active else None,
-                active.point_id if active else None,
+                run.run_id if run else None,
+                seg.point_id if seg else None,
             )
 
         try:
