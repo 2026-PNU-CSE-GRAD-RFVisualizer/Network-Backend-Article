@@ -4,13 +4,13 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
 from .config import PROJECT_ROOT, settings
 from .database import Database
-from .experiment import SessionManager, compute_device_offsets
+from .experiment import Conflict, ExperimentManager, compute_device_offsets
 from .export import export_experiment, import_points_csv
 from .metrics import Metrics
 from .mqtt_bridge import MqttBridge
@@ -33,7 +33,7 @@ window_buffer = WindowBuffer(settings.window_size_ms, settings.window_grace_ms) 
 hub = WebSocketHub()
 metrics = Metrics()
 store = ExperimentStore(settings.experiment_data_path)
-sessions = SessionManager(store)
+sessions = ExperimentManager(store)
 mqtt_bridge: MqttBridge | None = None
 tasks: list[asyncio.Task] = []
 
@@ -51,13 +51,34 @@ class ExperimentStart(BaseModel):
     note: str | None = None
 
 
-class SessionStart(BaseModel):
-    point_id: str
-    point_role: str
-    seconds: int | None = None
+class OffsetStart(BaseModel):
+    phase: str = "pre"          # pre | post
     note: str | None = None
-    # 이 위치로 옮겨 놓은 이동 센서. 지정하면 세션 시작과 동시에 재배치된다.
-    moving_node_id: str | None = None
+
+
+class OffsetCompute(BaseModel):
+    offset_run_id: str | None = None
+    phase: str = "pre"
+
+
+class PostOffset(BaseModel):
+    offset_run_id: str
+    run_id: str | None = None
+
+
+class RunStart(BaseModel):
+    direction: str = "forward"
+    pass_index: int = 1
+    offset_run_id: str | None = None
+    note: str | None = None
+
+
+class SegmentPrepare(BaseModel):
+    point_id: str
+    order_index: int
+    stabilization_seconds: int | None = None
+    recording_seconds: int | None = None
+    note: str | None = None
 
 
 class Assignment(BaseModel):
@@ -66,16 +87,13 @@ class Assignment(BaseModel):
     point_role: str
 
 
-class SessionStop(BaseModel):
-    discard: bool = False
-
-
 class PointsCsv(BaseModel):
     csv: str
 
 
 class ExportRequest(BaseModel):
-    # 압축 리허설 등 측정이 짧을 때 기대 샘플 수를 낮추는 값(미지정 시 설정값).
+    # 압축 리허설처럼 측정 시간이 짧을 때 기대 샘플 수를 낮춰 잡기 위한 값.
+    # 지정하지 않으면 설정값(위치당 30개)을 쓴다.
     expected_samples: int | None = None
 
 
@@ -106,12 +124,12 @@ async def watch_heartbeats() -> None:
             await hub.broadcast({"type": "node_status", "node": status})
         await asyncio.sleep(1)
 
-async def watch_session_deadline() -> None:
-    """30초가 지난 세션을 자동 종료한다. 현장에서 정지 버튼을 누를 필요가 없다."""
+async def watch_segment_deadline() -> None:
+    """기록 종료 시각이 지난 TestSegment 를 자동 완료한다. Run 에는 자동 종료가 없다."""
     while True:
-        finished = sessions.auto_stop_if_expired()
+        finished = sessions.auto_advance_segment()
         if finished is not None:
-            await hub.broadcast({"type": "session_finished", "session": finished})
+            await hub.broadcast({"type": "segment_completed", "segment": finished})
         await asyncio.sleep(0.2)
 
 @asynccontextmanager
@@ -122,10 +140,15 @@ async def lifespan(app: FastAPI):
     mqtt_bridge = MqttBridge(settings, loop, db, registry, window_buffer, hub, metrics,
                              store=store, sessions=sessions)
     mqtt_bridge.start()
+    # 백엔드 재시작 처리(§15): 이전에 running 으로 남은 Run/Segment 를 interrupted 로 표시.
+    # 열린 구간을 정상 완료로 숨기지 않는다.
+    interrupted = store.mark_all_open_interrupted(now_ms())
+    if interrupted:
+        logger.warning("이전 실행에서 열린 채 남은 Run/Segment 를 interrupted 로 표시: %s", interrupted)
     tasks.extend(
         [
             asyncio.create_task(watch_heartbeats()),
-            asyncio.create_task(watch_session_deadline()),
+            asyncio.create_task(watch_segment_deadline()),
             asyncio.create_task(db.flush_raw_loop(metrics)),
         ]
     )
@@ -148,7 +171,19 @@ async def lifespan(app: FastAPI):
         await db.close()
         store.close()
 
-app = FastAPI(title="3DGS RSSI Backend", version="0.4.0-paper", lifespan=lifespan)
+app = FastAPI(title="3DGS RSSI Backend", version="0.5.0-run", lifespan=lifespan)
+
+
+@app.exception_handler(Conflict)
+async def _conflict_handler(request: Request, exc: Conflict) -> JSONResponse:
+    # 상태 위반(중복 시작·순서 위반 등)은 409. 조용히 덮어쓰지 않는다.
+    return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+
+@app.exception_handler(ValueError)
+async def _value_error_handler(request: Request, exc: ValueError) -> JSONResponse:
+    return JSONResponse(status_code=400, content={"detail": str(exc)})
+
 
 @app.get("/health")
 async def health() -> dict[str, object]:
@@ -167,6 +202,9 @@ async def health() -> dict[str, object]:
         "jsonl_backup": str(store.jsonl_path),
         "export_root": str(settings.export_root_path),
         "rssi_filtered_scale": settings.rssi_filtered_scale,
+        "test_stabilization_seconds": settings.test_stabilization_seconds,
+        "test_recording_seconds": settings.test_recording_seconds,
+        "expected_test_points": settings.expected_test_points,
     }
 
 @app.get("/nodes/status")
@@ -186,12 +224,17 @@ async def set_node_meta(meta: NodeMeta) -> dict[str, object]:
     await db.upsert_node_meta(meta.model_dump())
     return {"ok": True, "node_id": meta.node_id}
 
-# -- 논문 실험 API (7/23 강의실 측정) --
+# ----------------------------------------------------------------------
+# 논문 실험 API (7/23 강의실 측정)
+# ----------------------------------------------------------------------
 
 @app.post("/experiment/start")
 async def experiment_start(body: ExperimentStart) -> dict[str, object]:
-    # 실험 시작마다 이름 뒤에 실행 시각을 붙여 새 experiment_id 를 만든다.
-    # (이전 실험 폴더는 남고 이번 실험은 새 폴더에 저장됨)
+    # 실험 시작 버튼을 누를 때마다 입력한 이름 뒤에 실행 시각을 붙여
+    # 매번 새로운 experiment_id 를 만든다. 그러면:
+    #   - 이전 실험 폴더는 그대로 남고 (experiments/<이전id>/)
+    #   - 이번 실험은 새 폴더(experiments/<새id>/)에 저장된다.
+    # 예: classroom_20260723  ->  classroom_20260723_213045
     base = body.experiment_id.strip() or "experiment"
     run_id = f"{base}_{time.strftime('%H%M%S')}"
     return sessions.start_experiment(run_id, body.ap_bssid,
@@ -216,52 +259,107 @@ async def experiment_assign(body: Assignment) -> dict[str, object]:
 async def experiment_assignments() -> dict[str, object]:
     return {"assignments": store.list_assignments(require_experiment())}
 
-@app.post("/session/start")
-async def session_start(body: SessionStart) -> dict[str, object]:
-    try:
-        session = sessions.start_session(
-            body.point_id, body.point_role,
-            body.seconds or settings.default_session_seconds, body.note,
-            moving_node_id=body.moving_node_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return session.to_dict()
+# -- Offset 측정 -----------------------------------------------------
+@app.post("/offset-run/start")
+async def offset_run_start(body: OffsetStart | None = None) -> dict[str, object]:
+    return sessions.start_offset_run(body.phase if body else "pre",
+                                     body.note if body else None)
 
-@app.post("/session/stop")
-async def session_stop(body: SessionStop) -> dict[str, object]:
-    return sessions.stop_session(discard=body.discard)
+@app.post("/offset-run/stop")
+async def offset_run_stop() -> dict[str, object]:
+    return sessions.stop_offset_run()
 
-@app.get("/session/current")
-async def session_current() -> dict[str, object]:
-    """측정 페이지가 0.5초마다 호출하는 상태 엔드포인트."""
-    active = sessions.active()
+@app.get("/offset-run/current")
+async def offset_run_current() -> dict[str, object]:
+    active = sessions.active_offset_run()
+    return {"offset_run": active.to_dict() if active else None}
+
+# -- 본 실험 Run -----------------------------------------------------
+@app.post("/run/start")
+async def run_start(body: RunStart) -> dict[str, object]:
+    return sessions.start_run(body.direction, body.pass_index, body.offset_run_id, body.note)
+
+@app.post("/run/end")
+async def run_end() -> dict[str, object]:
+    return sessions.end_run()
+
+@app.get("/run/current")
+async def run_current() -> dict[str, object]:
+    """UI 가 주기적으로 호출하는 현재 상태(§9.현재 상태 응답)."""
+    cur = now_ms()
+    run = sessions.active_run()
+    seg = sessions.active_test_segment()
     experiment_id = sessions.experiment_id
-    done: list[dict[str, object]] = []
-    if experiment_id:
-        done = [
-            {"point_id": s["point_id"], "point_role": s["point_role"],
-             "valid_samples": s["valid_samples"]}
-            for s in store.list_sessions(experiment_id)
-            if not s["superseded"]
+    cal_nodes, test_node = [], {}
+    for node, (point, role) in sorted(sessions.assignments().items()):
+        entry = {"node_id": node, "point_id": point,
+                 "online": next((n["online"] for n in registry.snapshot()
+                                 if n["node_id"] == node), False)}
+        if role == "calibration":
+            cal_nodes.append(entry)
+        elif role == "test":
+            test_node = entry
+    completed = []
+    if run is not None:
+        completed = [
+            {"point_id": s["point_id"], "attempt_index": s["attempt_index"],
+             "status": s["status"], "order_index": s["order_index"]}
+            for s in store.list_test_segments(run.run_id)
+            if s["status"] == "completed" and not s["superseded"]
         ]
     return {
         "experiment_id": experiment_id,
         "ap_bssid": sessions.ap_bssid,
         "ap_channel": sessions.ap_channel,
-        "session": active.to_dict() if active else None,
-        "progress": store.session_progress(active.session_id) if active else [],
-        "done_points": done,
-        "assignments": [
-            {"node_id": n, "point_id": p, "point_role": r}
-            for n, (p, r) in sorted(sessions.assignments().items())
-        ],
-        "tx": store.list_tx(experiment_id) if experiment_id else [],
+        "offset_run": (o.to_dict() if (o := sessions.active_offset_run()) else None),
+        "run": run.to_dict() if run else None,
+        "test_segment": seg.to_dict(cur) if seg else None,
+        "calibration_nodes": cal_nodes,
+        "test_node": test_node,
+        "completed_points": completed,
         "mqtt": mqtt_bridge.status() if mqtt_bridge else {"connected": False},
     }
 
-@app.get("/experiment/sessions")
-async def experiment_sessions() -> dict[str, object]:
-    return {"sessions": store.list_sessions(require_experiment())}
+# -- TestSegment -----------------------------------------------------
+@app.post("/test-segment/prepare")
+async def test_segment_prepare(body: SegmentPrepare) -> dict[str, object]:
+    return sessions.prepare_test_segment(
+        body.point_id, body.order_index,
+        body.stabilization_seconds if body.stabilization_seconds is not None
+        else settings.test_stabilization_seconds,
+        body.recording_seconds if body.recording_seconds is not None
+        else settings.test_recording_seconds,
+        body.note)
+
+@app.post("/test-segment/stop")
+async def test_segment_stop() -> dict[str, object]:
+    """현재 Test 즉시 종료(2분 전이라도). 정상 완료로 마감한다."""
+    return sessions.finish_test_segment()
+
+@app.post("/test-segment/discard")
+async def test_segment_discard() -> dict[str, object]:
+    """현재 Test 버리고 재측정 준비. C1~C4 연속 원본은 보존된다."""
+    return sessions.discard_test_segment()
+
+@app.get("/test-segment/current")
+async def test_segment_current() -> dict[str, object]:
+    seg = sessions.active_test_segment()
+    return {"test_segment": seg.to_dict() if seg else None}
+
+@app.get("/experiment/runs")
+async def experiment_runs() -> dict[str, object]:
+    return {"runs": store.list_runs(require_experiment())}
+
+# -- Legacy 차단 -----------------------------------------------------
+# 구 세션 API 는 새 Run/TestSegment 로 대체됐다. 조용히 성공시키지 않고 명시적으로 410.
+_LEGACY_MSG = ("이 API 는 제거되었습니다. /run/*, /test-segment/*, /offset-run/* 를 사용하세요. "
+               "(단일 세션 경로로는 새 실험 데이터를 만들 수 없습니다.)")
+
+@app.post("/session/start")
+@app.post("/session/stop")
+@app.get("/session/current")
+async def legacy_session_gone() -> dict[str, object]:
+    raise HTTPException(status_code=410, detail=_LEGACY_MSG)
 
 @app.get("/experiment/points")
 async def experiment_points() -> dict[str, object]:
@@ -279,17 +377,30 @@ async def experiment_tx(body: TxInput) -> dict[str, object]:
     return {"ok": True, "tx": store.list_tx(experiment_id)}
 
 @app.post("/experiment/offsets/compute")
-async def experiment_offsets() -> dict[str, object]:
-    return compute_device_offsets(store, require_experiment())
+async def experiment_offsets(body: OffsetCompute | None = None) -> dict[str, object]:
+    """지정 OffsetRun(또는 해당 phase 의 최신 완료 OffsetRun)으로 장치 편차 계산."""
+    exp = require_experiment()
+    offset_run_id = body.offset_run_id if body else None
+    if offset_run_id is None:
+        latest = store.latest_offset_run(exp, body.phase if body else "pre")
+        if latest is None:
+            raise HTTPException(status_code=400, detail="완료된 OffsetRun 이 없습니다.")
+        offset_run_id = latest["offset_run_id"]
+    return compute_device_offsets(store, exp, offset_run_id)
+
+@app.post("/run/attach-post-offset")
+async def run_attach_post_offset(body: PostOffset) -> dict[str, object]:
+    """사후 OffsetRun 을 본 실험 Run 에 연결(drift 확인용, 재보정 아님)."""
+    return sessions.attach_post_offset(body.offset_run_id, body.run_id)
 
 @app.post("/experiment/export")
 async def experiment_export(body: ExportRequest | None = None) -> dict[str, object]:
     experiment_id = require_experiment()
-    # 내보내기 직전에 offset 을 다시 계산해 summary 의 corrected_rssi 를 최신 상태로 만든다.
-    compute_device_offsets(store, experiment_id)
+    # offset 은 사전/사후 OffsetRun 별로 이미 계산되어 있다(여기서 재계산하지 않음).
     expected = (body.expected_samples if body and body.expected_samples
-                else settings.expected_samples_per_point)
-    return export_experiment(store, experiment_id, settings.export_root_path, expected)
+                else settings.test_recording_seconds)
+    return export_experiment(store, experiment_id, settings.export_root_path, expected,
+                             settings.expected_test_points, settings.expected_calibration_nodes)
 
 @app.get("/experiment/download/{which}")
 async def experiment_download(which: str) -> FileResponse:

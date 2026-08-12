@@ -28,11 +28,61 @@ CREATE TABLE IF NOT EXISTS session (
 CREATE INDEX IF NOT EXISTS idx_session_point
     ON session (experiment_id, point_id, started_at_ms);
 
+-- 사전·사후 장비 편차(Offset) 측정 회차. 본 실험 Run 과 분리해 저장한다.
+-- pre = 본 실험 보정에 사용. post = 실험 전후 편차 변화(drift) 확인용(재보정 안 함).
+CREATE TABLE IF NOT EXISTS offset_run (
+    offset_run_id  TEXT PRIMARY KEY,
+    experiment_id  TEXT NOT NULL,
+    phase          TEXT NOT NULL,           -- pre | post
+    status         TEXT NOT NULL,           -- running | completed | interrupted | discarded
+    started_at_ms  INTEGER NOT NULL,
+    ended_at_ms    INTEGER,
+    note           TEXT
+);
+
+-- 본 실험 회차. C1~C4 가 끊기지 않고 기록되는 한 회차(정/역방향).
+-- 사용자가 명시적으로 종료할 때까지 활성(자동 종료 없음).
+-- pre_offset_run_id: 이 Run 에 실제 적용한 사전 Offset 의 출처. post 는 사후 측정(없으면 NULL).
+CREATE TABLE IF NOT EXISTS experiment_run (
+    run_id              TEXT PRIMARY KEY,
+    experiment_id       TEXT NOT NULL,
+    direction           TEXT NOT NULL,      -- forward | reverse
+    pass_index          INTEGER NOT NULL,
+    status              TEXT NOT NULL,      -- running | completed | interrupted | discarded
+    started_at_ms       INTEGER NOT NULL,
+    ended_at_ms         INTEGER,
+    pre_offset_run_id   TEXT,
+    post_offset_run_id  TEXT,
+    note                TEXT
+);
+
+-- 이동 센서 T 가 특정 위치에서 실제로 기록되는 약 2분 구간.
+-- 시간 범위(recording_started_at_ms ~ recording_ended_at_ms)로 동시간 C1~C4 를 매칭한다.
+CREATE TABLE IF NOT EXISTS test_segment (
+    segment_id              TEXT PRIMARY KEY,
+    run_id                  TEXT NOT NULL,
+    point_id                TEXT NOT NULL,   -- T1~T10
+    order_index             INTEGER NOT NULL,
+    attempt_index           INTEGER NOT NULL DEFAULT 1,
+    status                  TEXT NOT NULL,   -- stabilizing | recording | completed | interrupted | discarded
+    prepared_at_ms          INTEGER NOT NULL,
+    recording_started_at_ms INTEGER NOT NULL,
+    recording_ended_at_ms   INTEGER NOT NULL,
+    actual_ended_at_ms      INTEGER,
+    superseded              INTEGER NOT NULL DEFAULT 0,
+    note                    TEXT
+);
+
 -- 원본 시계열. 비정상 값도 버리지 않고 valid=0 으로 보존한다. (계획서 §7.2 "Raw 데이터 보존")
+-- run_id / segment_id 는 신규(user_version 1). 기존 DB 는 store.py 마이그레이션이 ALTER 로 추가.
+--   C1~C4 이동 구간: run_id 있음, segment_id=NULL / Test 동시간: 둘 다 있음 / Legacy: 둘 다 NULL
+--   (session_id 는 하위호환 유지. 새 Run 기반 저장은 session_id=run_id 로 채운다.)
 CREATE TABLE IF NOT EXISTS measurement (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
     experiment_id      TEXT    NOT NULL,
     session_id         TEXT    NOT NULL,
+    run_id             TEXT,
+    segment_id         TEXT,
     point_id           TEXT    NOT NULL,
     point_role         TEXT    NOT NULL,
     node_id            TEXT    NOT NULL,
@@ -79,16 +129,19 @@ CREATE TABLE IF NOT EXISTS point (
     PRIMARY KEY (experiment_id, point_id)
 );
 
--- 장치별 RSSI 편차 보정 (계획서 §4.3)
+-- 장치별 RSSI 편차 보정 (계획서 §4.3).
+-- 사전·사후를 동시에 보존하려면 offset_run_id 로 구분해야 한다.
+-- (experiment_id, node_id) 만으로 키를 잡으면 사후 계산이 사전값을 덮어쓰므로 안 됨.
 CREATE TABLE IF NOT EXISTS device_offset (
-    experiment_id      TEXT NOT NULL,
+    offset_run_id      TEXT NOT NULL,
     node_id            TEXT NOT NULL,
+    experiment_id      TEXT NOT NULL,
     offset_median_dbm  REAL,
     device_offset_db   REAL,
     sample_count       INTEGER,
     std_db             REAL,
     calibrated_at_ms   INTEGER,
-    PRIMARY KEY (experiment_id, node_id)
+    PRIMARY KEY (offset_run_id, node_id)
 );
 
 -- TX(AP) 좌표. 그래픽스 파트로 넘길 config/tx_rx.json 생성에 사용.

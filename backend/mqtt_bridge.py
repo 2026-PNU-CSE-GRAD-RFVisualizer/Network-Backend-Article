@@ -39,7 +39,8 @@ class MqttBridge:
         self.metrics = metrics
         self.store = store
         self.sessions = sessions
-        # 연결 상태: "샘플이 안 들어오는 이유"(브로커 죽음 vs ESP32 죽음)를 구분하려면 필요
+        # 브로커 연결 상태. 현장에서 "샘플이 안 들어오는 이유"를 구분하려면 필요하다.
+        # (브로커가 죽은 것인지, ESP32 가 죽은 것인지)
         self.connected = False
         self.connect_count = 0
         self.disconnect_count = 0
@@ -65,7 +66,8 @@ class MqttBridge:
         self.connected = True
         self.connect_count += 1
         self.last_connected_ms = now_ms()
-        # 재연결 시 구독을 다시 걸어야 한다(안 걸면 연결은 살아있는데 메시지가 안 옴).
+        # 재연결 시에도 구독을 다시 걸어야 한다. 브로커가 재시작되면 세션이 사라지므로
+        # 여기서 다시 subscribe 하지 않으면 연결은 살아 있는데 메시지가 오지 않는다.
         client.subscribe("rssi/#")
         client.subscribe("gateway/#")
         client.subscribe("status/+/lwt")
@@ -101,7 +103,8 @@ class MqttBridge:
     async def handle_message(self, topic: str, payload: bytes) -> None:
         receive_ms = now_ms()
 
-        # 비상 경로(§12): 파싱 성공 여부와 무관하게 원본을 먼저 JSONL 에 남긴다.
+        # 비상 경로 (계획서 §12): 파싱 성공 여부와 무관하게 원본을 먼저 남긴다.
+        # MQTT 이후 어느 단계가 실패해도 이 파일만 있으면 데이터를 복구할 수 있다.
         if self.store is not None and not topic.endswith("/lwt"):
             active = self.sessions.active() if self.sessions else None
             self.store.append_jsonl(
@@ -160,7 +163,12 @@ class MqttBridge:
             await self._ingest(measurement, receive_ms, server_dt)
 
     async def _ingest(self, measurement: dict[str, Any], receive_ms: int, server_dt: datetime) -> None:
-        """측정 1건을 실험 저장소 + 실시간 파이프라인에 투입. 범위 밖 값도 valid=0 으로 기록(§7.2)."""
+        """측정값 1건을 실험 저장소 + 실시간 파이프라인에 투입.
+
+        범위를 벗어난 값도 실험 저장소에는 valid=0 으로 기록한다.
+        계획서 §7.2 는 "Raw 데이터 보존"과 "비정상 RSSI 범위 제외"를 함께 요구하므로,
+        저장 단계에서 버리지 않고 분석 단계에서 제외하는 방식을 쓴다.
+        """
         self._record_experiment(measurement, receive_ms)
 
         if not measurement["valid"]:
@@ -176,23 +184,29 @@ class MqttBridge:
             await self.hub.broadcast({"type": "node_status", "node": status})
 
     def _record_experiment(self, measurement: dict[str, Any], receive_ms: int) -> None:
-        """세션이 활성일 때만 실험 테이블에 기록한다."""
+        """저장 컨텍스트(§8)에 따라 measurement 테이블에 기록한다.
+
+        - Offset 측정 중: 모든 노드를 offset 역할로 저장.
+        - 본 실험 Run 중: C1~C4 는 항상(run_id, segment 는 기록창일 때만),
+          T 는 기록창 안일 때만. 이동·안정화 중 T 는 저장하지 않는다.
+        - 저장 대상이 아니면 건너뛴다(JSONL 원본은 handle_message 에서 이미 보존).
+        판정은 server_ts_ms(receive_ms) 로 하므로 MQTT 지연이 있어도 올바른 Segment 로 간다.
+        """
         if self.store is None or self.sessions is None:
             return
-        active = self.sessions.active()
-        if active is None:
+        mgr = self.sessions
+        node_id = measurement["node_id"]
+        ctx = mgr.offset_context(node_id) or mgr.context_at(node_id, receive_ms)
+        if ctx is None:
             return
-        # 세션 마감 시각을 넘겨 도착한 샘플은 그 위치의 창에 속하지 않는다.
-        if receive_ms > active.deadline_ms:
-            return
-        # 위치는 세션 라벨이 아니라 노드의 현재 배치로 정한다(고정 센서는 매 세션 누적).
-        point_id, point_role = self.sessions.resolve(measurement["node_id"], active)
         self.store.insert_measurements([{
-            "experiment_id": active.experiment_id,
-            "session_id": active.session_id,
-            "point_id": point_id,
-            "point_role": point_role,
-            "node_id": measurement["node_id"],
+            "experiment_id": mgr.experiment_id,
+            "session_id": ctx["run_id"],          # 하위호환: run_id 를 session_id 로도
+            "run_id": ctx["run_id"],
+            "segment_id": ctx["segment_id"],
+            "point_id": ctx["point_id"],
+            "point_role": ctx["point_role"],
+            "node_id": node_id,
             "node_ts_ms": measurement.get("timestamp"),
             "server_ts_ms": receive_ms,
             "seq": measurement.get("seq"),
@@ -207,7 +221,7 @@ class MqttBridge:
         }])
 
     def _validate_measurement(self, data: dict[str, Any], receive_ms: int) -> dict[str, Any] | None:
-        """파싱은 parsing.py 순수 함수에 위임(브로커 없이 테스트 가능)."""
+        """파싱은 backend/parsing.py 의 순수 함수에 위임한다 (브로커 없이 테스트 가능)."""
         return parse_measurement(data, receive_ms, ParseConfig(
             rssi_min=self.settings.rssi_min,
             rssi_max=self.settings.rssi_max,

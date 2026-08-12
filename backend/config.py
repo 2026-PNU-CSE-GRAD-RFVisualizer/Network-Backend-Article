@@ -28,8 +28,7 @@ class Settings(BaseSettings):
     enable_realtime: bool = False
 
     window_size_ms: int = 200
-    # 늦은 도착을 기다리는 유예 구간. 수집 지연 p95(자문 시 244ms)보다 크게 잡아
-    # 측정 구간이 프레임과 어긋나지 않게 한다.
+    # 실시간 윈도우 유예(전문가 자문 반영). 수집 지연 p95 보다 크게.
     window_grace_ms: int = 300
     window_flush_interval_ms: int = 50
     node_timeout_seconds: float = 5.0
@@ -42,6 +41,12 @@ class Settings(BaseSettings):
     default_session_seconds: int = 30
     expected_samples_per_point: int = 30
     rssi_filtered_scale: float = 1.0
+
+    # 최종 실험(Run/TestSegment) 설정
+    test_stabilization_seconds: int = 20    # 위치 도착 후 안정화
+    test_recording_seconds: int = 120       # 위치당 기록(2분)
+    expected_test_points: int = 10          # T1~T10
+    expected_calibration_nodes: int = 4     # C1~C4
 
     @property
     def experiment_data_path(self) -> Path:
