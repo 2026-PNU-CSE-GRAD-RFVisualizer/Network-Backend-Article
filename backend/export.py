@@ -18,6 +18,7 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import re
 import statistics
 from datetime import datetime, timezone
 from pathlib import Path
@@ -242,8 +243,8 @@ def quality_check(rows, test_points, cal_window, pre_offsets, post_offsets, poin
             problems.append(f"[{rid}] Test 위치 {len(pts)}개 (기대 {expected_test_points}) — 부족")
         elif len(pts) > expected_test_points:
             warnings.append(f"[{rid}] Test 위치 {len(pts)}개 (기대 {expected_test_points})")
-        # 방향 순서
-        nums = [int(p[1:]) for p in pts if p[1:].isdigit()]
+        # 방향 순서 (point_id 끝의 숫자를 사용: test-01 / T1 형식 모두 대응)
+        nums = [int(m.group()) for p in pts if (m := re.search(r"\d+$", p))]
         if run["direction"] == "forward" and nums != sorted(nums):
             warnings.append(f"[{rid}] 정방향 순서가 오름차순이 아님: {pts}")
         if run["direction"] == "reverse" and nums != sorted(nums, reverse=True):
@@ -277,7 +278,10 @@ def quality_check(rows, test_points, cal_window, pre_offsets, post_offsets, poin
             problems.append(f"Segment {s['segment_id']}({s['point_id']}) 에 C1~C4 중 {n_cal}개만 있습니다.")
 
     # 좌표·BSSID·채널
-    missing_coords = sorted({t["point_id"] for t in test_points if t["x"] is None})
+    # 좌표가 등록(point 테이블)되지 않았거나 0.0 등으로 비어 있으면 잡는다.
+    registered = {p["point_id"] for p in points if p["pos_x"] is not None}
+    missing_coords = sorted({t["point_id"] for t in test_points
+                             if t["x"] is None or t["point_id"] not in registered})
     if missing_coords:
         problems.append(f"좌표 미등록 Test 위치: {', '.join(missing_coords)}")
     if not tx_list:
@@ -356,6 +360,15 @@ def export_experiment(store: ExperimentStore, experiment_id: str,
     post_run = store.latest_offset_run(experiment_id, "post")
     pre_offsets = store.list_device_offsets(experiment_id, pre_run["offset_run_id"]) if pre_run else []
     post_offsets = store.list_device_offsets(experiment_id, post_run["offset_run_id"]) if post_run else []
+
+    # 등록 좌표(point 테이블)가 정답. payload 좌표는 이동 노드에서 (0,0,0) 이므로 신뢰할 수 없다.
+    # 여기서 rows 를 보정하면 raw/summary/test_points 산출물이 한 번에 교정된다.
+    # 등록되지 않은 point_id 는 손대지 않으므로 legacy 행이 깨지지 않는다.
+    coords = {p["point_id"]: p for p in points if p["pos_x"] is not None}
+    for r in rows:
+        p = coords.get(r["point_id"])
+        if p:
+            r["pos_x"], r["pos_y"], r["pos_z"] = p["pos_x"], p["pos_y"], p["pos_z"]
 
     summary = summarize(rows)
     test_points = summarize_test_points(rows, segments)
