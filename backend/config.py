@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     window_flush_interval_ms: int = 50
     node_timeout_seconds: float = 5.0
     timestamp_max_skew_ms: int = 600_000
-    rssi_min: int = -100
+    rssi_min: int = -110
     rssi_max: int = -10
 
     experiment_data_dir: str = "data"
